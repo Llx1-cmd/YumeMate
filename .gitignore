@@ -1,0 +1,31 @@
+# GPT-SoVITS 框架（数 GB：内嵌 runtime Python + 预训练模型 + 微调权重）
+# 安装说明见 README.md
+GPT-SoVITS-v2pro-20250604/
+
+# 运行时缓存（语音合成音频等）
+cache/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 工具产物
+.ruff_cache/
+.codeartsdoer/
+.merkle-snapshot.json
+.mermaid/
+
+# 日志
+*.log
+
+# 测试截图
+dbg_*.png
+
+# Streamlit 本地配置（可能含 secrets）
+.streamlit/secrets.toml
+
+# 系统
+.DS_Store
+Thumbs.db
+desktop.ini

@@ -1,0 +1,4 @@
+{
+  "typeCheckingMode": "off",
+  "extraPaths": ["backend"]
+}
