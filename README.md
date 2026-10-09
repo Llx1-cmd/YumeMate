@@ -1,162 +1,121 @@
 # 优香 AI 聊天系统 - YuukaChat
 
-一个基于 React + FastAPI 的二次元风格 AI 聊天应用，使用本地 Ollama Qwen 模型驱动。
+基于 Streamlit + FastAPI + Ollama + GPT-SoVITS 的二次元风格本地 AI 角色扮演聊天应用，支持多角色切换、语音合成与实时日历。
 
 ## ✨ 特性
 
-- 🎀 **二次元界面** - 粉紫渐变主题，流畅动画效果
-- ⚡ **实时对话** - WebSocket 流式输出，逐字显示
-- 🤖 **本地 AI** - 使用 Ollama + Qwen2.5:7b 模型
-- 📱 **响应式设计** - 适配桌面、平板、手机
-- 🔧 **前后端分离** - 易于扩展和维护
+- 🎀 **二次元界面** - 粉紫渐变主题、校园背景、角色立绘
+- 💬 **流式对话** - 逐字输出，多轮上下文
+- 🤖 **本地推理** - Ollama + Qwen2.5:7b，无需联网
+- 🔊 **语音合成** - GPT-SoVITS 日语 TTS，每角色独立音色权重
+- � **多角色** - 优香（yuuka）/ 未花（mika），一键切换
+- � **浮动日历** - 二次元风格日历面板，纯前端零重绘
+- 😀 **表情输入** - 微信式表情选择器
+- ⏰ **时间感知** - AI 能感知当前真实时间与日期
 
 ## 🚀 快速开始
 
 ### 前置要求
 
-1. **Python 3.10+** - 后端服务
-2. **Node.js 18+** - 前端开发
-3. **Ollama** - 本地 LLM 运行时（已安装）
-4. **Qwen2.5:7b 模型** - 已配置
+1. **Python 3.10+**
+2. **Ollama** + `qwen2.5:7b` 模型（`ollama pull qwen2.5:7b`）
+3. **GPT-SoVITS**（语音用；仅需聊天可不装）- 放置于项目根目录的 `GPT-SoVITS-v2pro-20250604/`，内含 `runtime/python.exe` 与预训练模型
 
 ### 安装步骤
 
-#### 1️⃣ 安装后端依赖
-
 ```bash
-cd backend
-pip install -r requirements.txt
+pip install -r backend/requirements.txt
+pip install streamlit
 ```
 
-#### 2️⃣ 安装前端依赖
+### 启动
 
-```bash
-cd frontend
-npm install
-```
+**一键启动（推荐）**
 
-#### 3️⃣ 启动服务
+双击 `start_all.bat`，自动拉起四个服务：
 
-**方式一：使用启动脚本（推荐）**
+| 顺序 | 服务 | 端口 | 说明 |
+|------|------|------|------|
+| 1 | Ollama | 11434 | 本地 LLM 推理 |
+| 2 | 后端 | 8000 | FastAPI 聊天/语音 API |
+| 3 | GPT-SoVITS | 9880 | 语音合成（权重加载约 1 分钟） |
+| 4 | 前端 | 8501 | Streamlit 界面 |
 
-```bash
-# Windows
-双击 start.bat
-```
+启动后浏览器访问 **http://localhost:8501**。停止服务 = 关闭对应命令行窗口。
 
-**方式二：手动启动**
+**仅聊天（无语音）**
 
-```bash
-# 终端1：启动后端
-cd backend
-python main.py
-
-# 终端2：启动前端
-cd frontend
-npm run dev
-```
-
-#### 4️⃣ 访问应用
-
-打开浏览器访问：**http://localhost:5173**
+双击 `start.bat`（只起后端 + 前端）。
 
 ## 📁 项目结构
 
 ```
 YuukaChat/
-├── backend/                 # Python 后端
-│   ├── main.py             # FastAPI 主程序
-│   ├── config.py           # 配置文件
-│   ├── requirements.txt    # Python 依赖
+├── frontend/
+│   └── streamlit_app.py        # Streamlit 主程序（界面/日历/语音开关）
+├── backend/
+│   ├── main.py                 # FastAPI 路由（/api/chat、/api/tts-* 等）
+│   ├── config.py               # 服务地址/端口配置
+│   ├── requirements.txt
 │   └── services/
-│       └── llm_service.py # Ollama 调用封装
-│
-├── frontend/               # React 前端
-│   ├── src/
-│   │   ├── components/     # UI 组件
-│   │   ├── hooks/          # React Hooks
-│   │   ├── styles/         # 样式文件
-│   │   └── types/          # TypeScript 类型
-│   └── package.json        # Node.js 依赖
-│
-└── start.bat               # Windows 启动脚本
+│       ├── llm_service.py      # Ollama 调用 + 时间感知注入
+│       ├── tts_service.py      # GPT-SoVITS 调用 + 角色权重切换
+│       └── character_service.py# 角色配置加载
+├── characters/
+│   ├── yuuka/                  # 优香：character.json + reference.wav + 立绘
+│   └── mika/                   # 未花：character.json + reference.wav + 立绘
+├── GPT-SoVITS-v2pro-20250604/  # GPT-SoVITS 框架（gitignore，需自行放置）
+├── cache/                      # 运行时缓存（gitignore）
+├── start_all.bat               # 一键启动（含语音）
+├── start.bat                   # 精简启动（仅聊天）
+└── CHANGELOG.md                # 变更日志
 ```
 
 ## 🎨 技术栈
 
-### 后端
-- **FastAPI** - 高性能 Web 框架
-- **WebSocket** - 实时双向通信
-- **Ollama** - 本地 LLM 推理引擎
-- **Qwen2.5:7b** - 通义千问大模型
-
-### 前端
-- **React 18** - UI 框架
-- **TypeScript** - 类型安全
-- **Vite** - 构建工具
-- **Ant Design** - UI 组件库
-- **Framer Motion** - 动画库
+- **前端** - Streamlit 1.63+（Python 单文件，components.v1.html 注入日历/语音开关交互）
+- **后端** - FastAPI + Uvicorn
+- **LLM** - Ollama + Qwen2.5:7b
+- **TTS** - GPT-SoVITS v2pro（角色级权重切换）
+- **角色配置** - JSON（人设 prompt / 模型 / 参考音频 / TTS 权重路径）
 
 ## 🔧 配置说明
 
-### 后端配置 (`backend/config.py`)
+### 服务地址（`backend/config.py`）
 
 ```python
-OLLAMA_BASE_URL = "http://localhost:11434"  # Ollama 地址
-OLLAMA_MODEL = "qwen2.5:7b-instruct-q4_K_M"  # 模型名称
-BACKEND_PORT = 8000  # 后端端口
+OLLAMA_BASE_URL = "http://localhost:11434"
+BACKEND_PORT = 8000
 ```
 
-### System Prompt 修改
+### 角色配置（`characters/<角色>/character.json`）
 
-编辑 `backend/config.py` 中的 `SYSTEM_PROMPT` 可以修改优香的：
-
-- 性格特点
-- 说话风格
-- 回复长度
-- 行为规范
+每个角色独立配置：人设 prompt、Ollama 模型名、参考音频文本、TTS 权重路径（相对项目根目录）。新增角色只需在 `characters/` 下建目录并填好 `character.json`，重启后端即可。
 
 ## 📝 使用说明
 
-1. **发送消息**
-   - 在底部输入框输入文字
-   - 按 Enter 或点击发送按钮
-
-2. **查看回复**
-   - AI 回复会逐字流式显示
-   - 显示"正在输入..."动画指示器
-
-3. **多轮对话**
-   - 自动维护对话上下文
-   - 支持连续多轮交互
+1. **聊天** - 底部输入框输入文字，点发送按钮（无回车发送）
+2. **表情** - 输入框右侧 😀 按钮展开表情面板
+3. **语音** - 角色信息区 🔊 开关，开启后 AI 回复自动配音
+4. **角色切换** - 界面角色区切换，语音权重自动跟随
+5. **日历** - 角色信息区 📅 按钮展开浮动日历
 
 ## 🎯 下一步计划
 
-- [ ] Phase 2: 对话历史持久化 + 多会话管理
-- [ ] Phase 3: 语音功能（录音 + TTS）
-- [ ] Phase 4: 3D VRM 角色展示（Three.js）
+- [ ] **群聊** - 多角色同台对话、角色间互动
+- [ ] **记忆系统** - 长期记忆持久化与召回
 
 ## ❓ 常见问题
 
-### Q: 前端无法连接后端？
-A: 确保：
-1. 后端已启动（终端显示 `Uvicorn running on 127.0.0.1:8000`）
-2. Ollama 服务已运行（`ollama serve`）
-3. 浏览器控制台无报错
+### Q: 启动后没有语音？
+A: GPT-SoVITS 权重加载约 1 分钟，期间聊天正常但语音不可用，稍等即可。
 
 ### Q: AI 回复很慢？
-A: 这是正常的，取决于：
-1. 你的 GPU/CPU 性能
-2. 模型大小（7B 参数）
-3. 首次加载需要初始化时间
+A: 首次推理需加载模型（约 4.7GB），后续会快。取决于 GPU/CPU 性能。
 
-### Q: 如何修改界面颜色？
-A: 编辑 `frontend/src/styles/theme.ts` 中的配色方案。
+### Q: 如何新增角色？
+A: 在 `characters/` 下新建目录，放入 `character.json`（参考现有角色）、`reference.wav`（参考音频）、立绘图片，重启后端。
 
 ## 📄 License
 
 MIT License
-
----
-
-**开发者提示：** 这是一个教学演示项目，适合学习前后端分离开发、WebSocket 实时通信、以及 AI 应用集成。
