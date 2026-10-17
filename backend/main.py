@@ -26,10 +26,29 @@ app.add_middleware(
 )
 
 
+@app.on_event("startup")
+async def startup_event():
+    """启动即后台预加载当前生效模型（上次选择已从 model_state.json 恢复）。
+
+    不阻塞启动流程；模型已在 Ollama 内存中时跳过，不重复加载。
+    """
+    target = llm_service.effective_model_now()
+    print(f"[Startup] 当前生效模型: {target or '（未配置）'}，触发后台预加载")
+    llm_service.start_preload()
+
+
 class ChatMessage(BaseModel):
     message: str
     history: List[Dict] = []
     character_id: str = "yuuka"
+
+
+class GroupChatMessage(BaseModel):
+    message: str
+    # 共享群聊历史：role 为 "user" / 角色id（如 "yuuka"/"mika"），保持顺序
+    history: List[Dict] = []
+    # 成员列表（按回复顺序），本阶段前端只传 ["yuuka", "mika"]，未来可扩展
+    members: List[str] = []
 
 
 class ConnectionManager:
@@ -119,7 +138,7 @@ async def tts_audio(character_id: str, text: str):
             tts_service.synthesize,
             character_id,
             tts_cfg,
-            cfg.to_full_dict()["model"],  # 翻译复用角色配置的 Ollama 模型
+            llm_service._effective_model(cfg.to_full_dict()),  # 翻译跟随当前生效模型（与聊天一致，避免双模型驻留）
             text,
         )
     except Exception as e:
@@ -162,6 +181,72 @@ async def chat_endpoint(chat: ChatMessage):
                 "character_id": chat.character_id,
             }
         )
+
+
+class ModelSwitch(BaseModel):
+    model: str
+
+
+@app.get("/api/models")
+async def models_endpoint():
+    """列出 Ollama 已下载的模型（代理 /api/tags）+ 当前生效模型"""
+    import requests as _rq
+    try:
+        r = _rq.get(f"{settings.OLLAMA_BASE_URL}/api/tags", timeout=5)
+        names = [m.get("name") for m in r.json().get("models", []) if m.get("name")]
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"无法连接 Ollama: {e}")
+    return {"models": names, "current": llm_service.overridden_model,
+            "preload": llm_service.preload_status()}
+
+
+@app.post("/api/model")
+async def set_model_endpoint(m: ModelSwitch):
+    """设置全局模型覆盖（持久化，重启后端自动恢复）并后台预加载新模型"""
+    llm_service.set_model(m.model)
+    llm_service.start_preload()
+    return {"status": "success", "current": llm_service.overridden_model}
+
+
+@app.post("/api/group/chat")
+async def group_chat_endpoint(chat: GroupChatMessage):
+    """群聊：用户一条消息后，按 members 顺序每个成员依次生成一条回复。
+
+    所有成员共享同一个群聊历史（history + 本轮前面成员的回复），
+    但每个成员用各自独立的 character prompt 调用，人格不合并。
+    单个成员生成失败不阻断后续成员（文字占位，不进后续上下文）。
+    """
+    replies = []
+    turn_replies = []
+    for member_id in chat.members:
+        try:
+            cfg = character_service.get(member_id)  # 角色不存在时抛 404
+        except HTTPException:
+            replies.append({"role": member_id, "content": f"⚠️ 成员 {member_id} 不存在", "ok": False})
+            continue
+        try:
+            text = await llm_service.group_chat_complete(
+                message=chat.message,
+                history=chat.history,
+                speaker=member_id,
+                turn_replies=turn_replies,
+            )
+            reply_content = text.strip()
+            ok = bool(reply_content)
+            if not ok:
+                reply_content = f"⚠️ {cfg.name} 暂时无法回复"
+        except Exception:
+            reply_content = f"⚠️ {cfg.name} 暂时无法回复"
+            ok = False
+        # ok=False 的失败占位：前端只显示不写聊天历史，也不进后续成员的上下文
+        replies.append({"role": member_id, "content": reply_content, "ok": ok})
+        if ok:
+            turn_replies.append({"role": member_id, "content": reply_content})
+    return {
+        "replies": replies,
+        "status": "success",
+        "members": chat.members,
+    }
 
 
 @app.websocket("/ws/chat")

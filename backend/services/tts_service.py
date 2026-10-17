@@ -81,6 +81,9 @@ class TTSService:
                 {"role": "user", "content": text},
             ],
             "stream": False,
+            # 常驻策略与聊天请求一致：不带 keep_alive 的请求会把常驻模型
+            # 的过期时间重置回 Ollama 默认 5 分钟
+            "keep_alive": -1,
             "options": {"temperature": 0.3, "num_predict": 300},
         }
         r = requests.post(

@@ -11,7 +11,7 @@
   "greeting": "诶～老师来啦！今天想和我做些什么呢？聊天、散散步，还是……只是想陪我待一会儿呀♪",
   "tts": {
     "gpt_model": "GPT-SoVITS-v2pro-20250604/GPT_weights_v2/Mika-e10.ckpt",
-    "sovits_model": "GPT-SoVITS-v2pro-20250604/SoVITS_weights_v2/Mika_e10_s140.pth",
+    "sovits_model": "GPT-SoVITS-v2pro-20250604/GPT_SoVITS/pretrained_models/gsv-v2final-pretrained/s2G2333k.pth",
     "refer_wav_path": "characters/mika/reference.wav",
     "prompt_text": "ふんんー？今度は貴方たち？",
     "prompt_language": "ja",
