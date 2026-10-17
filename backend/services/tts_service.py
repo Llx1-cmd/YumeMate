@@ -81,6 +81,10 @@ class TTSService:
                 {"role": "user", "content": text},
             ],
             "stream": False,
+            # qwen3 系列默认思考模式：不关思考时 num_predict 会被思考内容
+            # 全部耗尽（done_reason=length），正式翻译输出为空
+            # ——与聊天请求（llm_service）保持一致显式关闭
+            "think": False,
             # 常驻策略与聊天请求一致：不带 keep_alive 的请求会把常驻模型
             # 的过期时间重置回 Ollama 默认 5 分钟
             "keep_alive": -1,
