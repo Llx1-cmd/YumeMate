@@ -76,11 +76,15 @@ class CharacterService:
 
     def __init__(self):
         self._characters: Dict[str, CharacterConfig] = {}
+        # 每个角色目录的发现/加载诊断（供 /api/characters/health 报告）：
+        # {目录名: {"loaded": bool, "error": str or None}}
+        self.discovery: Dict[str, dict] = {}
         self.load_all()
 
     def load_all(self) -> None:
-        """扫描 characters/ 目录，加载所有角色"""
+        """扫描 characters/ 目录，加载所有角色（单个角色损坏不影响其他角色）"""
         self._characters.clear()
+        self.discovery = {}
         if not CHARACTERS_DIR.exists():
             print(f"[CharacterService] 角色目录不存在: {CHARACTERS_DIR}")
             return
@@ -90,23 +94,25 @@ class CharacterService:
                 continue
             try:
                 cfg = self._load_one(sub)
-                if cfg:
-                    self._characters[cfg.id] = cfg
-                    print(f"[CharacterService] 已加载角色: {cfg.id} ({cfg.name})")
+                self._characters[cfg.id] = cfg
+                self.discovery[sub.name] = {"loaded": True, "error": None}
+                print(f"[CharacterService] 已加载角色: {cfg.id} ({cfg.name})")
             except Exception as e:
+                self.discovery[sub.name] = {
+                    "loaded": False, "error": f"{type(e).__name__}: {e}",
+                }
                 print(f"[CharacterService] 加载失败 {sub.name}: {e}")
 
-    def _load_one(self, dir_path: Path) -> Optional[CharacterConfig]:
-        """加载单个角色目录"""
+    def _load_one(self, dir_path: Path) -> CharacterConfig:
+        """加载单个角色目录；配置缺失/损坏抛异常（load_all 捕获并记录诊断，
+        不影响其他角色加载）"""
         json_path = dir_path / "character.json"
         prompt_path = dir_path / "prompt.txt"
 
         if not json_path.exists():
-            print(f"[CharacterService] 跳过 {dir_path.name}: 缺少 character.json")
-            return None
+            raise FileNotFoundError("缺少 character.json")
         if not prompt_path.exists():
-            print(f"[CharacterService] 跳过 {dir_path.name}: 缺少 prompt.txt")
-            return None
+            raise FileNotFoundError("缺少 prompt.txt")
 
         with open(json_path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -132,6 +138,10 @@ class CharacterService:
                 detail=f"角色不存在: {character_id}"
             )
         return cfg
+
+    def is_loaded(self, character_id: str) -> bool:
+        """角色是否已成功加载进内存（健康检查/诊断用）"""
+        return character_id in self._characters
 
     def get_avatar_path(self, character_id: str) -> Optional[Path]:
         """取某个角色的头像文件路径"""

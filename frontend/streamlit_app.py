@@ -11,6 +11,8 @@ from urllib.parse import quote
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 from config import settings
 
+from character_admin import render_character_admin_page
+
 BACKEND_URL = f"http://{settings.BACKEND_HOST}:{settings.BACKEND_PORT}"
 
 
@@ -308,7 +310,12 @@ def render_sidebar():
         # ---- 弹性空间：把底部导航压到 Sidebar 底部（高度链见 .sb-spacer 的 CSS 注释）----
         st.markdown('<div class="sb-spacer"></div>', unsafe_allow_html=True)
 
-        # ---- 底部辅助导航（逻辑不变：设置 / 返回主页）----
+        # ---- 底部辅助导航（逻辑不变：管理 / 设置 / 返回主页）----
+        if st.button("👤 角色管理", use_container_width=True, key="nav_admin"):
+            st.session_state.current_character_id = "charadmin"
+            st.session_state.current_group_id = None
+            st.rerun()
+
         if st.button("⚙ 设置", use_container_width=True, key="nav_settings"):
             st.session_state.current_character_id = "settings"
             st.session_state.current_group_id = None
@@ -1838,11 +1845,13 @@ def main():
         render_home_page()
     elif cid == "settings":
         render_settings_page()
+    elif cid == "charadmin":
+        render_character_admin_page()
     else:
         render_chat_page(cid)
 
     # 底部版权（聊天页不显示，避免占底部妨碍输入区贴底）
-    if cid is None or cid == "settings":
+    if cid is None or cid == "settings" or cid == "charadmin":
         st.markdown("""<div style='text-align:center;padding:20px;color:#A0AEC0;font-size:13px;'>💬 聊天大厅 v2.0 · Powered by Qwen2.5 + FastAPI + Streamlit</div>""", unsafe_allow_html=True)
 
 

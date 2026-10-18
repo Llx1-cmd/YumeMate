@@ -9,6 +9,7 @@ import json
 from config import settings
 from services.llm_service import llm_service
 from services.character_service import character_service
+from services.character_state import character_state
 from services.tts_service import tts_service
 
 app = FastAPI(
@@ -87,8 +88,49 @@ async def health_check():
 
 @app.get("/api/characters")
 async def list_characters():
-    """返回所有可用角色列表（公开信息，不含人设 prompt）"""
-    return {"characters": character_service.list_public()}
+    """返回所有可用角色列表（公开信息，不含人设 prompt）+ 启用状态（新增可选
+    字段 enabled，旧前端不受影响）"""
+    chars = [
+        {**c, "enabled": character_state.is_enabled(c["id"])}
+        for c in character_service.list_public()
+    ]
+    return {"characters": chars}
+
+
+class CharacterEnabledSwitch(BaseModel):
+    enabled: bool
+
+
+@app.get("/api/characters/health")
+async def characters_health():
+    """全部角色健康检查汇总：「已发现 / 配置检查通过 / 已启用」分开表示，
+    含逐项诊断（JSON 解析、必需字段、提示词、头像、模型与 TTS 配置完整性）。
+    纯文件系统 + JSON 检查，不调 Ollama 生成、不实际合成语音；
+    TTS 配置异常只记录 tts_ok=False，不阻止纯文字聊天。"""
+    report = character_state.health_report()
+    # 安全过滤：不向前端暴露绝对本地路径（path 移除、备份只保留文件名）
+    sf = report.get("state_file")
+    if isinstance(sf, dict):
+        sf.pop("path", None)
+        backup = sf.get("corrupt_backup")
+        if backup:
+            sf["corrupt_backup"] = backup.replace("\\", "/").rsplit("/", 1)[-1]
+    return report
+
+
+@app.post("/api/characters/{character_id}/enabled")
+async def set_character_enabled(character_id: str, m: CharacterEnabledSwitch):
+    """设置角色启用/停用状态（独立状态文件 backend/data/character_state.json，
+    不修改角色配置文件；新角色无记录默认启用）"""
+    cfg = character_service.get(character_id)  # 不存在抛 404
+    state_diag = character_state.set_enabled(character_id, m.enabled)
+    return {
+        "status": "success",
+        "character_id": character_id,
+        "name": cfg.name,
+        "enabled": m.enabled,
+        "state_file": state_diag,
+    }
 
 
 @app.get("/api/characters/{character_id}")
@@ -127,6 +169,12 @@ async def tts_audio(character_id: str, text: str):
     相同 (角色, 文本) 命中服务端缓存，不重复生成。
     """
     cfg = character_service.get(character_id)  # 角色不存在时抛 404
+    # 停用角色不可用（连文字聊天都不能用，TTS 附属能力同样拦截）
+    if not character_state.is_enabled(character_id):
+        return JSONResponse(
+            status_code=403,
+            content={"error": "角色已停用，无法合成语音"},
+        )
     tts_cfg = cfg.tts
     if not tts_cfg.get("refer_wav_path"):
         return JSONResponse(
@@ -158,6 +206,10 @@ async def tts_audio(character_id: str, text: str):
 @app.post("/api/chat")
 async def chat_endpoint(chat: ChatMessage):
     """同步聊天：发送消息 + 历史 + character_id，返回完整回复"""
+    # 新请求使用角色前验证：不存在 404、已停用 403（后端拦截，不只前端隐藏）
+    cfg = character_service.get(chat.character_id)
+    if not character_state.is_enabled(chat.character_id):
+        raise HTTPException(status_code=403, detail=f"角色已停用: {cfg.name}")
     try:
         response = await llm_service.chat_complete(
             message=chat.message,
@@ -223,6 +275,10 @@ async def group_chat_endpoint(chat: GroupChatMessage):
             cfg = character_service.get(member_id)  # 角色不存在时抛 404
         except HTTPException:
             replies.append({"role": member_id, "content": f"⚠️ 成员 {member_id} 不存在", "ok": False})
+            continue
+        if not character_state.is_enabled(member_id):
+            # 停用成员：占位不进后续成员的上下文（与「不存在」同模式），不阻断其他成员
+            replies.append({"role": member_id, "content": f"⚠️ {cfg.name} 已停用", "ok": False})
             continue
         try:
             text = await llm_service.group_chat_complete(
