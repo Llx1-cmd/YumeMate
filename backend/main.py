@@ -11,6 +11,7 @@ from services.llm_service import llm_service
 from services.character_service import character_service
 from services.character_state import character_state
 from services.tts_service import tts_service
+from services.group_service import group_service
 
 app = FastAPI(
     title="YuukaChat API",
@@ -50,6 +51,23 @@ class GroupChatMessage(BaseModel):
     history: List[Dict] = []
     # 成员列表（按回复顺序），本阶段前端只传 ["yuuka", "mika"]，未来可扩展
     members: List[str] = []
+
+
+class GroupCreate(BaseModel):
+    """创建群聊（第五阶段）：名称只做显示（群 ID 服务端生成，不进路径），
+    members 为初始成员（至少一个有效角色）"""
+    name: str
+    members: List[str]
+
+
+class GroupMemberAdd(BaseModel):
+    """邀请角色加入群聊（第五阶段）"""
+    member_id: str
+
+
+class GroupRename(BaseModel):
+    """修改群名称（第六阶段）：仅动态群；名称只做显示，不进路径/ID"""
+    name: str
 
 
 class ConnectionManager:
@@ -555,6 +573,62 @@ async def set_model_endpoint(m: ModelSwitch):
     llm_service.set_model(m.model)
     llm_service.start_preload()
     return {"status": "success", "current": llm_service.overridden_model}
+
+
+# ==================== 动态群聊管理（第五阶段） ====================
+
+@app.get("/api/groups")
+async def list_groups():
+    """群列表：全部动态群 + 固定群覆盖条目（fixed=true，仅被管理过成员的
+    固定群出现，前端据此覆盖 GROUPS 默认成员）；无覆盖的固定群不返回，
+    前端用内置 GROUPS，行为与旧版一致。"""
+    return {"groups": group_service.list_groups()}
+
+
+@app.post("/api/groups")
+async def create_group(m: GroupCreate):
+    """创建群聊：名称非空（≤32 字）、至少一个有效成员（存在且已启用），
+    群 ID 服务端安全生成（uuid，用户输入不进路径），不覆盖已有群、
+    不影响固定群；成员保序去重。"""
+    group = group_service.create_group(m.name, m.members)
+    return {"status": "success", "group": group}
+
+
+@app.post("/api/groups/{group_id}/members")
+async def add_group_member(group_id: str, m: GroupMemberAdd):
+    """邀请角色入群（动态群或固定群）：群存在（404）、角色存在且已启用
+    （400）、不可重复添加（400）；固定群写覆盖条目（不动默认注册表，
+    删覆盖即恢复默认）。成功后下一次群聊请求即用最新成员列表，
+    不修改历史消息。"""
+    return group_service.add_member(group_id, m.member_id)
+
+
+@app.delete("/api/groups/{group_id}/members/{member_id}")
+async def remove_group_member(group_id: str, member_id: str):
+    """移除群成员（动态群或固定群）：只改本群成员列表（该角色不再参与
+    后续回复），保留其历史消息，不动角色目录/配置/头像/全局启停状态。
+    最后一名成员不可移除（400，群内至少保留一人）；固定群写覆盖条目。"""
+    return group_service.remove_member(group_id, member_id)
+
+
+@app.post("/api/groups/{group_id}/name")
+async def rename_group(group_id: str, m: GroupRename):
+    """修改群名称（第六阶段，仅动态群）：名称去首尾空白、非空（400）、
+    ≤32 字（400，与创建一致）；固定群拒绝（400）；不存在的群 404。
+    只改本群 name——群 ID 不变（名称只做显示，绝不用于 ID 或文件路径）、
+    成员列表/其他群/历史消息不受影响（前端历史按群 ID 存储，原名继续
+    显示）；持久化到 groups.json（原子写，写失败回滚内存并返回 500）。"""
+    return group_service.rename_group(group_id, m.name)
+
+
+@app.delete("/api/groups/{group_id}")
+async def delete_group(group_id: str):
+    """删除群聊（第六阶段，仅动态群）：固定群拒绝（400）；不存在的群
+    404（幂等明确——已删除的群再次删除返回 404，与既有约定一致）。
+    只删 groups.json 中该群条目（含防御性清理同 ID 覆盖条目）：不动角色
+    目录/配置/头像/立绘/背景/TTS/启停状态、不动其他群；写入失败回滚内存
+    并返回 500（内存与文件保持一致）。前端群聊历史由前端按群 ID 自行清理。"""
+    return group_service.delete_group(group_id)
 
 
 @app.post("/api/group/chat")

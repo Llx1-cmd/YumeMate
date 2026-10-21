@@ -154,6 +154,8 @@ def send_group_message(message, history, members):
 
 # 群聊定义（成员列表概念；扩展更多群/成员只改这里，后端 members 参数化不写死）
 # 每个群：显式群名 + members 列表（按回复顺序）
+# 第五阶段：动态群（用户创建）存后端 groups.json（group_service），前端缓存
+# 合并展示；固定群在前、动态群在后，互不影响
 GROUPS = {
     "yuuka_mika": {
         "name": "优香 × 未花",
@@ -162,14 +164,53 @@ GROUPS = {
 }
 
 
+def load_groups_cache():
+    """动态群缓存（后端 /api/groups）：首次/失效后拉取，其余渲染读缓存
+    零网络（fragment 内调用安全）。失败返回空列表（固定群不受影响）。"""
+    if st.session_state.get("groups_cache") is None:
+        try:
+            r = requests.get(f"{BACKEND_URL}/api/groups", timeout=5)
+            groups = r.json().get("groups", []) if r.status_code == 200 else []
+        except Exception:
+            groups = []
+        st.session_state.groups_cache = groups
+    return st.session_state.groups_cache
+
+
+def _invalidate_groups():
+    """群数据失效（创建/邀请/移除成功后调用，下次渲染重新拉取）"""
+    st.session_state.groups_cache = None
+
+
+def _all_groups():
+    """固定 GROUPS + 动态群合并视图 {gid: {name, members}}（固定在前，
+    动态群 id 带 g_ 前缀，与固定群 id 无冲突）。
+    固定群覆盖条目（fixed=true，第 68 条成员管理产生）：members 用覆盖值，
+    名称仍以本地 GROUPS 为准（后端注册表与 GROUPS 同步，双保险）。"""
+    merged = dict(GROUPS)
+    for g in load_groups_cache():
+        gid = g.get("id", "")
+        entry = {"name": g.get("name") or gid, "members": g.get("members") or []}
+        if g.get("fixed") and gid in GROUPS:
+            entry["name"] = GROUPS[gid]["name"]
+        merged[gid] = entry
+    return merged
+
+
 def group_members(group_id):
-    """按群 id 取成员列表（未知群返回空列表）"""
-    return GROUPS.get(group_id, {}).get("members", [])
+    """按群 id 取成员列表（固定群或动态群；未知群返回空列表）"""
+    return _all_groups().get(group_id, {}).get("members", [])
 
 
 def group_display_name(group_id):
-    """群显示名（GROUPS 里显式配置）"""
-    return GROUPS.get(group_id, {}).get("name", group_id)
+    """群显示名（GROUPS 显式配置或动态群创建时的名称）"""
+    return _all_groups().get(group_id, {}).get("name", group_id)
+
+
+def _is_dynamic_group(group_id):
+    """动态群判断（id 以 g_ 前缀开头，服务端生成）。第 69 条起用于群设置
+    面板显隐（改名/删除仅动态群）；成员管理（第 68 条）不分固定/动态群"""
+    return group_id.startswith("g_")
 
 
 def _member_aliases(member_id, characters):
@@ -225,6 +266,12 @@ def init_session_state():
         st.session_state.current_group_id = None
     if "characters_cache" not in st.session_state:
         st.session_state.characters_cache = None
+    # 动态群列表缓存（后端 /api/groups；None = 待拉取，操作后失效）
+    if "groups_cache" not in st.session_state:
+        st.session_state.groups_cache = None
+    # 创建群聊视图标志（第五阶段；True = 渲染群创建页，优先于其他路由）
+    if "group_create_mode" not in st.session_state:
+        st.session_state.group_create_mode = False
     # 侧边栏各主分类的展开状态（替代 st.expander，避免图标字体回退问题）
     if "sidebar_expanded" not in st.session_state:
         st.session_state.sidebar_expanded = {
@@ -268,6 +315,17 @@ def get_current_messages(key_base, mode="single"):
 def _nav_to_character(cid):
     """导航回调：切到某角色单聊页（on_click 先于脚本执行，改完即渲染新页）"""
     st.session_state.current_character_id = cid
+    st.session_state.current_group_id = None
+
+
+def _nav_to_group(gid):
+    """导航回调：切到群聊页"""
+    st.session_state.current_group_id = gid
+
+
+def _nav_to_create_group():
+    """导航回调：进入创建群聊视图（第五阶段；退出创建页时清标志）"""
+    st.session_state.group_create_mode = True
     st.session_state.current_group_id = None
 
 
@@ -334,7 +392,9 @@ def render_sidebar():
         # ---- 更多功能（群聊已上线；语音随聊天页开关）----
         st.markdown('<div class="sb-more-title">更多功能</div>', unsafe_allow_html=True)
         characters = load_characters_cache()
-        for gid in GROUPS:
+        # 群列表 = 固定 GROUPS + 动态群（第五阶段，合并视图：固定在前）；
+        # 动态群来自后端缓存（创建/邀请/移除后失效重拉）
+        for gid in _all_groups():
             gname = group_display_name(gid)
             if st.session_state.current_group_id == gid:
                 # 群聊激活行（HTML 渲染，与选中角色行同风格）
@@ -346,9 +406,11 @@ def render_sidebar():
                     unsafe_allow_html=True,
                 )
             else:
-                if st.button(f"👥 群聊 · {gname}", key=f"nav_group_{gid}", use_container_width=True):
-                    st.session_state.current_group_id = gid
-                    st.rerun()
+                st.button(f"👥 群聊 · {gname}", key=f"nav_group_{gid}", use_container_width=True,
+                          on_click=_nav_to_group, args=(gid,))
+        # 创建群聊入口（第五阶段）：进入群创建页（名称 + 选初始成员）
+        st.button("＋ 创建群聊", use_container_width=True, key="sb_add_group",
+                  on_click=_nav_to_create_group)
         st.markdown(
             '<div class="sb-more-row">○ 语音<span class="sb-soon">聊天页开关</span></div>',
             unsafe_allow_html=True,
@@ -832,6 +894,14 @@ def _do_send(prompt, key_base, mode="single"):
     messages.append({"role": "user", "content": prompt})
 
     if mode == "group":
+        # 空群拦截（第五阶段：动态群成员可被全部移除）：回滚刚加的 user 消息，
+        # 错误只显示不进历史（与请求级失败同模式，不动状态机本身）
+        if not group_members(key_base):
+            messages.pop()
+            st.session_state[f"_send_error_{key_base}"] = (
+                "群内暂无成员，请先在「成员管理」中邀请角色加入"
+            )
+            return
         # 本轮回复顺序：明确点名角色时该角色优先（称呼首次出现位置排序，
         # 未点名保持默认顺序）——只改顺序，不改最多两条回复的规则
         ordered = detect_mention_order(prompt, group_members(key_base), load_characters_cache() or [])
@@ -1002,9 +1072,15 @@ def render_chat_fragment(key_base, name, mode="single"):
         )
     if not rows:
         if mode == "group":
+            _gm = group_members(key_base)
+            _gcount = len(_gm) if _gm else 0
+            if _gcount:
+                _sub = f"发出第一条消息吧～群内 {_gcount} 位成员都会回复你"
+            else:
+                _sub = "群内暂无成员，请先在「成员管理」中邀请角色加入"
             body = (
                 f'<div class="welcome-title">「{name}」群聊</div>'
-                '<div class="welcome-sub">发出第一条消息吧～两位都会回复你</div>'
+                f'<div class="welcome-sub">{_sub}</div>'
             )
         else:
             # 空对话的欢迎语：优先角色 greeting（character.json），否则通用兜底（与主页 Hero 一致）
@@ -1029,7 +1105,10 @@ def render_chat_fragment(key_base, name, mode="single"):
         st.markdown(f'<div class="chat-messages">{"".join(rows)}</div>', unsafe_allow_html=True)
 
     # ---- 输入区（方案B：输入框 + 右侧表情按钮 + 发送按钮，回车不可用）----
-    input_key = f"chat_input_{key_base}"
+    # key 固定不含 key_base：切角色/群聊时 widget 不卸载重建（重建+挂载淡入=闪烁，
+    # 第 59 条）；同一时刻只渲染一个聊天 fragment，无 key 冲突；副作用=输入草稿
+    # 跨角色保留（不丢失，视为特性）
+    input_key = "chat_input"
     st.markdown('<div style="height:12px;"></div>', unsafe_allow_html=True)
     c1, c2, c3 = st.columns([11, 2, 3])
     with c1:
@@ -1141,6 +1220,7 @@ def render_character_info_bar(title, status):
         'else if(!(btn.contains(t))&&!(t.closest&&t.closest(".cal-panel"))){var p=P.getElementById("cal-panel");if(p)p.classList.remove("cal-open");}'
         '});'
         'P.defaultView.addEventListener("resize",place);'
+        'P.defaultView.addEventListener("scroll",place,true);'
         'requestAnimationFrame(function(){requestAnimationFrame(place);});'
         'setTimeout(place,300);setTimeout(place,1000);'
         'render();'
@@ -1183,14 +1263,16 @@ def render_character_info_bar(title, status):
         unsafe_allow_html=True,
     )
     # 日历按钮 iframe：36×36，CSS 默认隐藏（不占文档流），由 iframe 内 JS
-    # 计算外页 cal-slot 位置后精确定位并显示——面板开合/月份切换零 rerun
+    # 计算外页 cal-slot 位置后精确定位并显示——面板开合/月份切换零 rerun；
+    # 滚动（捕获阶段监听任意滚动容器）与 resize 均触发 place 跟随重定位，
+    # 图标不随页面滚动漂移（第 68 条问题二修复）
     components.html(cal_iframe, width=36, height=36, scrolling=False)
     # 🔊 语音开关 iframe（信息行最右）：点击模拟点击 fragment 内真实
     # st.button（只触发 fragment rerun）；图标经 500ms 轮询读真实按钮文本同步
     voice_js = (
         'var P=window.parent.document;'
         'var btn=document.getElementById("voice-btn");'
-        'var realBtn=function(){return P.querySelector(\'[class*="st-key-voice_toggle_"] button\');};'
+        'var realBtn=function(){return P.querySelector(\'[class*="st-key-voice_toggle"] button\');};'
         'if(!btn)return;'
         'var cont=null;'
         'try{cont=window.frameElement;}catch(e){}'
@@ -1215,6 +1297,7 @@ def render_character_info_bar(title, status):
         '}'
         'btn.onclick=function(e){e.stopPropagation();var rb=realBtn();if(rb)rb.click();};'
         'P.defaultView.addEventListener("resize",place);'
+        'P.defaultView.addEventListener("scroll",place,true);'
         'requestAnimationFrame(function(){requestAnimationFrame(place);});'
         'setTimeout(place,300);setTimeout(place,1000);'
         'setInterval(sync,500);'
@@ -1337,11 +1420,332 @@ def render_chat_page(character_id):
         render_chat_fragment(character_id, name)
 
 
+# ==================== 动态群聊管理（第五阶段） ====================
+
+def _group_api(method, path, timeout=10, **kw):
+    """群管理 API 调用：返回 (ok, data_or_detail)"""
+    try:
+        r = requests.request(method, f"{BACKEND_URL}{path}", timeout=timeout, **kw)
+        if r.status_code == 200:
+            return True, r.json()
+        try:
+            detail = r.json().get("detail", f"HTTP {r.status_code}")
+        except Exception:
+            detail = f"HTTP {r.status_code}"
+        return False, detail
+    except requests.exceptions.Timeout:
+        return False, "请求超时（后端繁忙，请稍后重试）"
+    except requests.exceptions.ConnectionError:
+        return False, "无法连接到后端服务（请确认 8000 端口已启动）"
+    except Exception as e:
+        return False, f"请求异常：{type(e).__name__}"
+
+
+def _remove_group_member(gid, mid):
+    """on_click 回调：移除群成员（服务端校验；成功后失效群缓存，fragment
+    rerun 即刷新成员列表；失败写入操作提示，原成员列表保持不变）"""
+    ok, d = _group_api("DELETE", f"/api/groups/{gid}/members/{mid}")
+    if ok:
+        _invalidate_groups()
+        st.session_state[f"_group_op_{gid}"] = ("ok", f"已移除 {d.get('name', mid)}")
+    else:
+        st.session_state[f"_group_op_{gid}"] = ("err", str(d))
+
+
+def _add_group_member(gid):
+    """on_click 回调：邀请角色入群（选择来自邀请 selectbox 的 session 值；
+    服务端校验角色存在/启用/未重复，成功失效群缓存，失败保留原列表并提示）"""
+    mid = st.session_state.get(f"_ginvite_{gid}")
+    if not mid:
+        return
+    ok, d = _group_api("POST", f"/api/groups/{gid}/members",
+                       json={"member_id": mid})
+    if ok:
+        _invalidate_groups()
+        st.session_state.pop(f"_ginvite_{gid}", None)
+        st.session_state[f"_group_op_{gid}"] = ("ok", f"已邀请 {d.get('name', mid)} 加入")
+    else:
+        st.session_state[f"_group_op_{gid}"] = ("err", str(d))
+
+
+# ==================== 群设置：改名 / 删除（第六阶段，第 69 条） ====================
+
+def _start_rename(gid):
+    """on_click 回调：进入改名编辑态（输入 key 此刻不存在，编辑态首次
+    渲染时以当前名初始化——避开 widget key 赋值限制）"""
+    st.session_state[f"_grename_edit_{gid}"] = True
+
+
+def _cancel_rename(gid):
+    """on_click 回调：取消改名（清编辑标志与输入 key，名称不变）"""
+    st.session_state.pop(f"_grename_edit_{gid}", None)
+    st.session_state.pop(f"_grename_{gid}", None)
+
+
+def _save_rename(gid):
+    """on_click 回调：保存新群名称（服务端校验；成功失效群缓存——侧边栏
+    与群聊页标题随 fragment rerun 立即更新，群 ID 与历史不变；失败保持
+    编辑态并提示，输入内容不丢）"""
+    name_key = f"_grename_{gid}"
+    name = (st.session_state.get(name_key) or "").strip()
+    if not name:
+        st.session_state[f"_group_set_op_{gid}"] = ("err", "群聊名称不能为空")
+        return
+    ok, d = _group_api("POST", f"/api/groups/{gid}/name",
+                       json={"name": name})
+    if ok:
+        _invalidate_groups()
+        st.session_state.pop(f"_grename_edit_{gid}", None)
+        st.session_state.pop(name_key, None)
+        st.session_state[f"_group_set_op_{gid}"] = ("ok", f"群名称已更新为「{d.get('name', name)}」")
+    else:
+        st.session_state[f"_group_set_op_{gid}"] = ("err", str(d))
+
+
+def _start_delete(gid):
+    """on_click 回调：进入删除确认态（尚未产生任何修改）"""
+    st.session_state[f"_gdel_confirm_{gid}"] = True
+
+
+def _cancel_delete(gid):
+    """on_click 回调：取消删除（清确认标志，不产生任何修改）"""
+    st.session_state.pop(f"_gdel_confirm_{gid}", None)
+
+
+def _confirm_delete(gid):
+    """on_click 回调：确认删除群聊（仅动态群；服务端校验）。
+
+    成功后清理本群相关 session 状态——只清该群 ID 对应记录：
+    - group_conversations[gid]（该群聊天历史，其他群/单聊不动）
+    - _group_send_{gid}（群聊发送状态机，防删除后 fragment KeyError）
+    - _group_op_/_ginvite_/_grename_*/_gdel_confirm_（本群操作态）
+    然后失效群缓存（侧边栏移除该群）并安全切回主页（current_group_id/
+    current_character_id 置 None，下次 fragment rerun 渲染欢迎页）。
+    失败时退出确认态并提示，群与历史保持原样。"""
+    ok, d = _group_api("DELETE", f"/api/groups/{gid}")
+    st.session_state.pop(f"_gdel_confirm_{gid}", None)
+    if not ok:
+        st.session_state[f"_group_set_op_{gid}"] = ("err", str(d))
+        return
+    st.session_state.group_conversations.pop(gid, None)
+    for k in (f"_group_send_{gid}", f"_group_op_{gid}", f"_ginvite_{gid}",
+              f"_grename_edit_{gid}", f"_grename_{gid}"):
+        st.session_state.pop(k, None)
+    _invalidate_groups()
+    if st.session_state.get("current_group_id") == gid:
+        st.session_state.current_group_id = None
+        st.session_state.current_character_id = None
+
+
+def _render_group_settings_panel(group_id):
+    """群聊页左栏「群设置」区块（第六阶段，仅动态群）：修改群名称 + 删除群聊。
+
+    - 改名：编辑态切换（输入 key 在编辑态首次渲染前以当前名初始化，
+      避开 widget 赋值限制）；保存走服务端校验，取消不动名称；
+    - 删除：二次确认（明确提示删的是群聊而非角色）；取消不产生修改；
+      确认后由 _confirm_delete 清理本群状态并切回主页；
+    - 均为 fragment 外 on_click 回调（与成员管理同模式），不触碰聊天
+      fragment 状态机本身。"""
+    edit_key = f"_grename_edit_{group_id}"
+    name_key = f"_grename_{group_id}"
+    confirm_key = f"_gdel_confirm_{group_id}"
+    with st.expander("⚙️ 群设置", expanded=False):
+        op = st.session_state.pop(f"_group_set_op_{group_id}", None)
+        if op:
+            (st.success if op[0] == "ok" else st.error)(op[1])
+
+        # --- 修改群名称 ---
+        if not st.session_state.get(edit_key):
+            st.button("✏️ 修改群名称", key=f"_grn_btn_{group_id}",
+                      use_container_width=True,
+                      on_click=_start_rename, args=(group_id,))
+        else:
+            if name_key not in st.session_state:
+                st.session_state[name_key] = group_display_name(group_id)
+            st.text_input(
+                "新群名称（去首尾空白，最多 32 字）",
+                key=name_key,
+            )
+            c1, c2 = st.columns(2)
+            c1.button("💾 保存名称", key=f"_grn_save_{group_id}", type="primary",
+                      use_container_width=True,
+                      on_click=_save_rename, args=(group_id,))
+            c2.button("取消", key=f"_grn_cancel_{group_id}",
+                      use_container_width=True,
+                      on_click=_cancel_rename, args=(group_id,))
+
+        # --- 删除群聊（二次确认） ---
+        st.markdown('<div style="height:8px;"></div>', unsafe_allow_html=True)
+        if not st.session_state.get(confirm_key):
+            st.button("🗑️ 删除群聊", key=f"_gdel_btn_{group_id}",
+                      use_container_width=True,
+                      on_click=_start_delete, args=(group_id,))
+        else:
+            st.warning(
+                f"确认删除群聊「{group_display_name(group_id)}」？\n\n"
+                f"仅删除该群聊与成员列表，**不删除任何角色、立绘、语音或文件**；"
+                f"该群的聊天记录将一并清除，其他群聊与单聊不受影响。"
+            )
+            c1, c2 = st.columns(2)
+            c1.button("❗ 确认删除", key=f"_gdel_ok_{group_id}", type="primary",
+                      use_container_width=True,
+                      on_click=_confirm_delete, args=(group_id,))
+            c2.button("取消", key=f"_gdel_cancel_{group_id}",
+                      use_container_width=True,
+                      on_click=_cancel_delete, args=(group_id,))
+
+
+def _leave_group_create():
+    """退出创建群聊视图：清标志与表单 widget（下次进入为全新空表单）"""
+    st.session_state.group_create_mode = False
+    for k in ("_gcname_new", "_gcmembers_new"):
+        st.session_state.pop(k, None)
+
+
+def render_group_create_page():
+    """创建群聊页：自定义名称 + 从已启用角色选初始成员。
+
+    校验以服务端为准（前端仅即时提示）：空名称 / 空成员 / 无效或停用角色
+    均由 POST /api/groups 拒绝；群 ID 由服务端安全生成（uuid），群名称只做
+    显示，不进路径。创建成功后失效群缓存并直接进入新群聊页。"""
+    st.markdown(
+        """
+        <div style="text-align:center; padding:40px 20px 10px 20px;">
+            <h1 style="color:#FF6B9D; font-size:32px;">➕ 创建群聊</h1>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    c1, c2 = st.columns([1, 5])
+    with c1:
+        if st.button("← 返回", use_container_width=True, key="_gc_back",
+                     on_click=_leave_group_create):
+            pass
+    with c2:
+        st.markdown(
+            '<div style="color:#A0AEC0;font-size:13px;padding-top:8px;">'
+            '校验以服务端为准 · 创建后立即进入群聊</div>',
+            unsafe_allow_html=True,
+        )
+
+    # 表单初值只在此处设置一次（widget key 赋值规则，同创建角色页）
+    for k, v in (("_gcname_new", ""), ("_gcmembers_new", [])):
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+    name = st.text_input(
+        "群聊名称（必填，将显示在侧边栏与群聊页，最多 32 字）",
+        key="_gcname_new",
+    )
+    # 候选成员：已启用的角色（options 直接用角色 id，format_func 显示名字）
+    characters = load_characters_cache() or []
+    enabled_chars = [c for c in characters if c.get("enabled", True)]
+    name_map = {c["id"]: c.get("name", c["id"]) for c in characters}
+    members = st.multiselect(
+        "初始成员（必选，至少一个已启用角色；入群后可随时邀请/移除）",
+        options=[c["id"] for c in enabled_chars],
+        format_func=lambda i: name_map.get(i, i),
+        key="_gcmembers_new",
+    )
+
+    if st.button("✅ 创建群聊", type="primary", use_container_width=True,
+                 key="_gc_submit"):
+        # 前端即时提示（服务端会独立再校验）
+        if not name.strip():
+            st.error("群聊名称不能为空")
+        elif not members:
+            st.error("至少选择一个角色作为初始成员")
+        else:
+            with st.spinner("正在创建群聊…"):
+                ok, d = _group_api("POST", "/api/groups",
+                                  json={"name": name.strip(), "members": members},
+                                  timeout=30)
+            if ok:
+                new_gid = (d.get("group") or {}).get("id")
+                st.session_state.pop("_gcname_new", None)
+                st.session_state.pop("_gcmembers_new", None)
+                st.session_state.group_create_mode = False
+                _invalidate_groups()
+                if new_gid:
+                    # 直接进入新群聊页（下次 fragment rerun 渲染）
+                    st.session_state.current_group_id = new_gid
+                st.rerun(scope="fragment")
+            else:
+                st.error(f"创建失败：{d}")
+
+
+def _render_group_member_panel(group_id, members, characters):
+    """群聊页左栏「成员管理」区块：显示当前成员（固定群与动态群均可
+    邀请/移除，第 68 条）。
+
+    - 成员行带移除按钮（on_click 回调，成功后缓存失效、fragment rerun
+      即刷新）；最后一名由服务端拒绝（400，前端提示）；
+    - 邀请 = selectbox（未加入的已启用角色）+ 邀请按钮；
+    - 固定群成员变更存后端覆盖条目（删覆盖即恢复默认，前端透明）；
+    - 历史消息与角色文件不受任何影响（移除只改本群成员列表）。
+    """
+    char_map = {c["id"]: c for c in characters}
+    title = "👥 成员管理"
+    with st.expander(f"{title}（{len(members)} 人）", expanded=False):
+        op = st.session_state.pop(f"_group_op_{group_id}", None)
+        if op:
+            (st.success if op[0] == "ok" else st.error)(op[1])
+        if not members:
+            st.info("群内暂无成员——邀请角色加入后才能开始群聊")
+        for mid in members:
+            c = char_map.get(mid, {})
+            m1, m2 = st.columns([3, 1])
+            with m1:
+                st.markdown(
+                    f'<div style="display:flex;align-items:center;gap:8px;'
+                    f'padding:3px 0;color:#4A4A6A;font-size:14px;">'
+                    f'<span style="width:10px;height:10px;border-radius:50%;'
+                    f'background:{c.get("color") or "#B9A6DE"};display:inline-block;"></span>'
+                    f'<b>{c.get("name", mid)}</b>'
+                    + (f'<span style="color:#8A8490;font-size:12px;">（已停用）</span>'
+                       if not c.get("enabled", True) else "")
+                    + "</div>",
+                    unsafe_allow_html=True,
+                )
+            with m2:
+                st.button("移除", key=f"_grm_{group_id}_{mid}",
+                          use_container_width=True,
+                          on_click=_remove_group_member,
+                          args=(group_id, mid))
+        # 邀请区：未加入本群的已启用角色（服务端还会独立校验）
+        in_group = set(members)
+        candidates = [
+            c for c in characters
+            if c.get("enabled", True) and c["id"] not in in_group
+        ]
+        st.markdown('<div style="height:8px;"></div>', unsafe_allow_html=True)
+        if candidates:
+            inv_map = {c["id"]: c.get("name", c["id"]) for c in candidates}
+            inv_key = f"_ginvite_{group_id}"
+            st.selectbox(
+                "邀请角色加入",
+                options=[c["id"] for c in candidates],
+                format_func=lambda i: inv_map.get(i, i),
+                key=inv_key, index=0,
+            )
+            st.button("＋ 邀请加入", use_container_width=True,
+                      key=f"_ginv_btn_{group_id}",
+                      on_click=_add_group_member, args=(group_id,))
+        else:
+            st.caption("所有已启用角色都在群里了")
+
+
 def render_group_page(group_id):
-    """群聊页：左侧立绘舞台（第一成员）+ 群信息条 + 右侧群聊 fragment。
+    """群聊页：左侧立绘舞台（第一成员）+ 群信息条 + 成员管理 + 右侧群聊 fragment。
 
     复用单聊页的舞台/背景/信息条/聊天 fragment 结构，只换标题与消息渲染模式；
     群聊历史存 group_conversations[group_id]，与单聊完全隔离。
+    第五阶段 + 第 68 条：所有群（固定与动态）左栏均带「成员管理」
+    （显示/邀请/移除）；成员列表实时来自后端（操作后缓存失效重拉），
+    固定群变更存后端覆盖条目（删覆盖即恢复默认），下一次群聊请求即用
+    最新成员列表。
+    第六阶段 + 第 69 条：动态群左栏另有「群设置」（改名/删除，二次确认；
+    改名后标题与侧边栏随缓存失效重拉立即更新，群 ID 与历史不变）。
     """
     members = group_members(group_id)
     characters = load_characters_cache()
@@ -1359,6 +1763,11 @@ def render_group_page(group_id):
             lead_id, lead_name, ver=(char_map.get(lead_id) or {}).get("avatar_ver"),
             bg_color=(char_map.get(lead_id) or {}).get("background_color"),
         )
+        # 成员管理（第五阶段 + 第 68 条）：固定群与动态群均可邀请/移除
+        _render_group_member_panel(group_id, members, characters)
+        # 群设置（第六阶段 + 第 69 条）：改名/删除仅动态群（固定群由系统定义）
+        if _is_dynamic_group(group_id):
+            _render_group_settings_panel(group_id)
 
     with col_chat:
         render_chat_fragment(group_id, group_name, mode="group")
@@ -2011,11 +2420,13 @@ def render_app():
     # 渲染侧边栏
     render_sidebar()
 
-    # 根据当前状态路由到对应页面（群聊优先于单聊）
+    # 根据当前状态路由到对应页面（创建群聊 > 群聊 > 单聊/辅助页）
     gid = st.session_state.current_group_id
     cid = st.session_state.current_character_id
 
-    if gid:
+    if st.session_state.get("group_create_mode"):
+        render_group_create_page()
+    elif gid:
         render_group_page(gid)
     elif cid is None:
         render_home_page()
@@ -2027,7 +2438,8 @@ def render_app():
         render_chat_page(cid)
 
     # 底部版权（聊天页不显示，避免占底部妨碍输入区贴底）
-    if cid is None or cid == "settings" or cid == "charadmin":
+    if (cid is None or cid == "settings" or cid == "charadmin"
+            or st.session_state.get("group_create_mode")):
         st.markdown("""<div style='text-align:center;padding:20px;color:#A0AEC0;font-size:13px;'>💬 聊天大厅 v2.0 · Powered by Qwen2.5 + FastAPI + Streamlit</div>""", unsafe_allow_html=True)
 
 
