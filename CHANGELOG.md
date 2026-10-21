@@ -621,3 +621,131 @@
 - **后端不可达场景**：页面显示「无法连接到后端服务」+「当前显示的可能不是最新数据」（读缓存）✓。**回归**：单聊 200（3.1s）、群聊 200、模型预加载 qwen3:8b ok、TTS status True、TTS 合成 200（16.1s）✓。
 - **清理**：临时角色 _admin_bad 已删、Playwright 脚本与输出已删、character_state.json 已删（恢复原始状态=文件不存在）。前后端均在运行（8000/8501）。
 - **未验证项**：管理页在真实浏览器（非 headless）的视觉效果；多用户并发操作状态文件的竞态（单人低并发，第一阶段已知边界）。
+### 52. 角色系统第三阶段：角色配置编辑（名称 / 简介 / 人设 / 头像）（2026-10-18）
+- **`backend/services/character_service.py` 新增编辑服务（+175 行，不改加载/发现逻辑）**：`reload_one`（保存后重载单角色内存——llm_service 每次聊天都经 `character_service.get()` 取 prompt，reload 后后续聊天即用新人设，**llm_service.py 零改动**）；`_atomic_write_text`（同目录临时文件 + `os.replace` 原子替换，失败保留原文件，统一 LF）；`update_profile`（名称去首尾空白、禁止为空；从磁盘读当前 json 仅改 name/description 字段，其他字段原样，ensure_ascii=False + indent=2 保持原格式）；`update_prompt`（禁止空提示词，原文写入保留换行与中英日字符，保存后重读校验内容一致才返回）；`update_avatar`（≤5MB、PIL `verify()` 完整解码校验、PNG/JPG/WEBP 白名单——扩展名由图片实际格式决定不信任上传文件名；换格式时旧扩展名头像先改名备份再替换、任一步失败回滚恢复，成功才清备份——否则 `get_avatar_path` 按优先级仍会命中旧文件；写入路径全部由服务端拼接到该角色目录内）。PIL 为函数内 import（环境已随 Streamlit/GPT-SoVITS 提供，不新增依赖声明）。
+- **`backend/main.py` 新增 4 路由（+59 行）**：`GET /api/characters/{id}/profile`（编辑页数据：name/description/prompt 全文/avatar_ext）、`PUT .../profile`（名称+简介）、`PUT .../prompt`（人设）、`POST .../avatar`（base64 JSON 上传，避免 multipart 依赖）。错误统一 HTTPException 中文 detail（400 校验 / 404 角色不存在 / 500 写入失败），不暴露绝对路径与堆栈。不存在角色 404、路径穿越 ID 经内存字典查找天然 404、无任何路径参数不受信任。
+- **`frontend/character_admin.py` 编辑视图（+269 行）**：卡片「✏️ 编辑配置」按钮（仅 loaded 角色）→ 编辑页分区块保存（头像 / 名称与简介 / 人设提示词），每区独立校验独立保存互不影响；表单初值来自服务端 GET profile，保存后重拉以服务端为准；头像预览与列表头像 URL 加 `?v=<时间戳>` 破浏览器缓存（更换头像后立即可见新图）；退出编辑清全部 widget state（下次进入显示服务端最新值）。
+- **实施中修复的 bug**：头像上传成功后 `st.session_state[uploader_key] = None` 清空选择器——在 file_uploader **已渲染后的同一 run 内**赋值会被 Streamlit 拒绝（StreamlitAPIException 中断脚本，上传成功但成功消息与预览刷新全部丢失，后端日志 POST 200 但无后续 GET）。修复：置清空 flag，下次 rerun 在 uploader 渲染**之前**赋值。
+- **测试（API 32/32 + 行为验证 + UI 15/15 + 回归 10/10，测试后已全部还原）**：①API：profile 读写与磁盘一致、名称 strip、空名称/空人设/假图片/超 5MB/无效 base64/BMP 白名单外均 400 且原文件不动、jpeg↔png↔jpg 格式切换旧文件清理无 .bak 残留、其他字段（greeting/tts/color/model）不受影响、不存在角色与路径穿越 404、未花不受影响；②聊天新人设生效（行为级验证）：PUT「只回复 P3OK」的测试人设后单聊回复恰为 P3OK，还原后恢复正常优香语气；③UI（Playwright）：编辑入口/初值一致/空值拒绝/名称保存/人设保存/头像上传+预览刷新（?v 变化）/列表新名称/未花不受影响/重进编辑页显示保存后值；④回归：健康检查（state_file 无 path 键）、启停（停用→群聊占位「⚠️ 圣园未花 已停用」不阻断→恢复）、单聊 200、群聊双成员 ok、TTS tts_available=True + 合成 200、模型 qwen3:8b。测试中的 2 个脚本级误报（T2d 断言把「老师」写成「先生」、UI 测试在清空后才取人设基线导致服务端被写短）均已定位为测试自身问题并修正，非产品缺陷。
+- **范围控制**：未创建/删除角色、未动模型/TTS 参数、llm_service.py 与 tts_service.py 零改动、聊天页 fragment/CSS/群聊/单聊/启停/健康检查语义不变、无新依赖（PIL 复用环境既有）。简介沿用 character.json 既有 description 字段。
+- **清理**：测试备份与脚本（cache/p3test/）已删、优香配置三件套已字节级还原（json/prompt 与原件 diff 为空、avatar.jpeg 恢复、测试 png/jpg 已删）、character_state.json 已删（回归测试产生，原始状态=不存在）。
+- **未验证项**：编辑页在真实浏览器（非 headless）的视觉效果；上传超大分辨率图片（仅校验了字节数与可解码性，未限制像素尺寸）；多用户同时编辑同一角色（单人低并发场景）。
+### 53. 头像像素尺寸安全检查补充（2026-10-18）
+- **背景**：第 52 条遗留「未限制像素尺寸」——超大分辨率图片虽受 5MB 字节数与可解码性校验，但缺像素级限制（解压炸弹类风险：小文件声明超大尺寸）。
+- **修改（仅 `backend/services/character_service.py` 的 `update_avatar`）**：新增常量 `MAX_AVATAR_EDGE=4096`（最长边）与 `MAX_AVATAR_PIXELS=16_000_000`（总像素 1600 万）；`Image.open` 后**解码前**按 header 中的 `img.size` 检查（此时像素未加载，拒绝超大图不耗解码内存），超限 400「图片尺寸过大（W×H，要求…）」；用 `warnings.catch_warnings()` + `simplefilter("error", Image.DecompressionBombWarning)` 包住 open+verify——PIL 的 DecompressionBombWarning 升级为异常、DecompressionBombError 本身是异常，两者统一捕获后 400「图片像素数过大（疑似解压炸弹），已拒绝」（与「无法解码」区分错误信息）。所有校验仍在写入之前，拒绝时原头像不动（既有原子写/回滚机制不变）。
+- **测试（10/10 PASS，测后已还原）**：①最长边 4097×100 → 400 尺寸过大；②边合规但总像素 4096×4096=1677 万超限 → 400；③手写假 PNG（IHDR 声明 100000×100000、IDAT 仅一行数据，落 PIL 炸弹区间）→ 400「疑似解压炸弹」——错误信息证实 PIL 的 DecompressionBombError 分支真实触发（非仅靠自身尺寸检查）；④三次拒绝后原头像 sha256 逐字节一致、无 .bak/.tmp-write 残留；⑤合法 512×512 上传 200（磁盘切到 avatar.png）；⑥边界值 4000×4000（=1600 万整，不超）上传 200；⑦回归：假图片/超 5MB 既有校验仍 400。还原：avatar.jpeg 从 git 恢复（130990 字节）、avatar.png 已删、重启后端确认 avatar_ext=jpeg 且头像接口字节与磁盘一致、健康检查两角色 loaded+config_ok、单聊 200（5.8s）。
+- **范围控制**：main.py 路由/前端 character_admin.py/llm/tts/群聊/预加载零改动；无新依赖（warnings 为标准库）。
+### 54. 更换头像抛 StreamlitValueAssignmentNotAllowedError：file_uploader 清空只能换 key（2026-10-18）
+- **现象（用户真实使用复现）**：给 mika 更换头像后抛 `StreamlitValueAssignmentNotAllowedError: Values for the widget with key '_eavatar_mika' cannot be set using st.session_state`，堆栈落在 `st.file_uploader` 渲染处——脚本中断，成功消息与头像预览之后的区块（名称/人设）全部不渲染。
+- **根因（两层）**：第 52 条的「渲染前赋值」修复对 Streamlit 1.63 无效——uploader 在之前任何 run 实例化过后，对该 widget key 的**任何用户代码赋值**（无论渲染前后）都会在渲染时被 `check_session_state_rules` 拒绝（is_new_widget=False + 值来自当前 run 用户赋值）。且第 52 条 Playwright 测试 U7 属**假通过**：成功消息与预览图都在崩溃点**之前**渲染，两个断言恰好都满足，而测试没检查崩溃点之后的区块，脚本实际已崩。后续尝试 pop 只清后端 session_state 副本，file_uploader 的已选文件存于**前端 widget state**，rerun 时前端仍回传旧值，页面上照样显示已选文件。
+- **修复（仅 `frontend/character_admin.py`，后端零改动）**：uploader key 改为带序号 `_eavatar_{cid}_{n}`（n 存非 widget key `_eupcnt_{cid}`，其余 rerun 不变保证 key 稳定）；上传成功后序号 +1 → 旧 widget 整体废弃、新 key uploader 为全新空状态——这是 file_uploader 唯一可靠的清空方式；顺手 pop 旧 key 遗留值；`_leave_edit` 相应改为按 `_eavatar_{cid}_` 前缀清理全部序号 key + `_eupcnt_`；删除失效的 `_eclr_` flag 机制。
+- **测试（15/15 PASS，复现用户场景：mika 连续两次上传，测后已还原）**：每轮断言六项——成功消息、**无 stException/stError 异常元素**、崩溃点之后区块仍渲染（名称输入框初值正确）、人设 textarea 完整、**uploader 已清空（页面无已选文件名）**、预览 `?v` 刷新；另测退出重进后无残留文件名、无异常、初值正确。前端日志全程 0 Traceback。还原：mika/avatar.jpg 从 git 恢复（36535 字节）、测试 png 已删、后端已重启（avatar_ext=jpg、头像接口字节与磁盘一致、健康检查两角色正常）。
+- **教训（测试方法论）**：验证「操作后页面正常」必须断言**崩溃点之后**的元素存在 + 无异常元素标记，只断言操作结果元素（消息/预览）会漏掉脚本中途崩溃的假通过；Streamlit widget key 赋值限制：实例化后赋值必炸、pop 合法但清不掉前端 widget state、file_uploader 清空唯一解是换 key。
+### 55. 换头像后侧边栏/聊天页头像不更新：头像 URL 加 mtime 版本破缓存（2026-10-18）
+- **现象（用户真实使用复现）**：管理页上传头像成功（编辑页 `?v=` 机制生效、预览正常），但**左侧角色列表头像无变化，刷新也没用**。
+- **根因**：第三阶段只给管理页（character_admin.py）的头像 URL 加了 `?v=` 破缓存，而 streamlit_app.py 的 6 处头像引用（侧边栏选中角色 img / 侧边栏非选中按钮 CSS background-image / 聊天气泡 / 大厅 hero 兜底 / 聊天页立绘舞台兜底）全是不带参数的裸 `/api/characters/{id}/avatar`——FileResponse 无 Cache-Control 头时浏览器用 heuristic 缓存旧图，Streamlit rerun 不重建同 src 的 img/CSS（URL 不变不重新加载），页面内「刷新」只触发 rerun 拿不到新图。
+- **修复（三处配合）**：①`character_service.py` 的 `to_public_dict` 新增 `avatar_ver` 字段（=头像文件 mtime 秒，实时查磁盘、无头像 None）——换头像后 mtime 变即得新版本值；②`main.py` avatar 端点 FileResponse 加 `Cache-Control: no-cache`（浏览器可缓存但展示前须重新验证，FileResponse 自带 ETag/Last-Modified、未变 304 几乎零开销）——根治 heuristic 缓存，兜底覆盖拿不到 ver 的引用；③`streamlit_app.py` 新增 `avatar_url(cid, ver)` 工具函数，6 处引用改为拼 `?v={avatar_ver}`（侧边栏两处/聊天气泡两处/大厅 hero/立绘舞台兜底 + render_stage_and_background 加 ver 参数）；④`character_admin.py` 换头像成功后清 `st.session_state.characters_cache`（streamlit_app 的角色列表缓存填后不失效）——rerun 后侧边栏重新 fetch 拿新 ver，**换头像后侧边栏立即刷新、无需 F5**。
+- **测试（Playwright 6/6 PASS，复现用户场景，测后已还原用户头像）**：上传前侧边栏按钮 background-image 带 `?v=` → 上传新图后同一 rerun 内 `?v=` 变化（1792317994→1792318032）→ 拦截到的 mika 头像响应字节==测试图（浏览器真实加载了新图）→ 回列表侧边栏保持新版本 → 进聊天页选中态 img 同为新 `?v=` → 全程无 stException。后端验证：`/api/characters` 每角色返回 avatar_ver、avatar 响应含 Cache-Control: no-cache + ETag + Last-Modified。回归：单聊 200（mika 15.2s）、健康检查两角色 loaded+config_ok、TTS 在线。
+- **注意**：测试期间发现磁盘上 mika/avatar.png（485KB）为用户 17:58 上传的新头像——测试前后均按字节保留/恢复（sha256 校验一致），未被测试覆盖丢失。
+### 56. 停用角色聊天报错不友好：HTTP 403 特判为中文提示（2026-10-18）
+- **现象（用户真实使用报告）**：停用角色后在聊天页发消息，界面显示「服务错误（HTTP 403）」，不知何意、也无下一步指引。
+- **根因**：后端 `/api/chat` 的停用拦截（第一阶段语义，返回 `HTTPException(403, detail="角色已停用: {角色名}")`）本身正常；前端 `send_chat_message` 对所有非 200 统一输出 `服务错误（HTTP {状态码}）`，未区分 403 语义。
+- **修复（仅 `frontend/streamlit_app.py` 的 `send_chat_message`，后端零改动）**：在 200 早返回之后、通用错误文案之前插入 403 特判，返回「该角色已停用，如需启用请前往设置中启用」（用户指定文案）。错误仍走既有 `_send_error_` 机制：红色气泡仅 UI 展示、不写入聊天历史、下次发送自动清除；用户消息本身保留在会话中。
+- **测试（UI 4/4 + 回归 5/5，未改动任何角色状态）**：mika 当时正处于用户设置的停用状态，测试直接复现真实场景、无需启停切换（测后仍保持用户原样）。①停用角色发消息：新文案正常显示、旧「服务错误（HTTP 403）」不再出现、用户消息保留、无 Streamlit 异常（Playwright 4/4）；②API 层确认 403 + detail「角色已停用: 圣园未花」；③回归：启用角色（优香）正常发送 200、回复写入历史、无错误气泡、无误显示停用文案、无异常（5/5，测试会话关闭即消失、不污染用户对话数据，语音已关避免 TTS 权重切换）。
+- **说明**：文案按用户原话执行；实际启用入口在侧边栏「角色管理」页（非「设置」页），如需文案与入口一致可后续调整。群聊停用成员走「⚠️ 已停用」占位不阻断（不涉及此文案）；单聊 403 被拦后无回复产生，连带 TTS 也不会触发（`/api/tts-audio` 的 403 在聊天场景不可达）。
+- **范围控制**：后端 main.py / 启停语义 / fragment 结构 / 群聊逻辑 / llm / tts 零改动；仅前端一处分支插入。
+### 57. 停用角色的「在线」状态改为「离线」灰显（2026-10-18）
+- **需求（用户提出）**：角色停用后，界面上仍显示「在线」（绿点），与实际停用状态矛盾——应显示「离线」。
+- **修改（仅前端两文件，后端零改动；enabled 字段 /api/characters 第一阶段已返回）**：
+  ①`streamlit_app.py` 四处显示点按 enabled（`char.get("enabled", True)`，字段缺失时保持「在线」不破坏旧语义）——侧边栏选中角色行（HTML）、侧边栏非选中按钮（CSS ::after 的 content 与颜色）、聊天大厅 hero 标签、聊天页角色信息条（`{subtitle} · 在线/离线`）与立绘舞台左下角状态角标（`render_stage_and_background` 加 `enabled=True` 参数，群聊调用不传默认在线、群聊语义不动）；停用时统一灰点灰字（#B3A8BA，与侧边栏次级文字同色），新增 `.off` 变体 CSS（`.sb-status.off .dot` / `.character-status.off .dot` / `.hall-online.off`）。群聊信息条「群聊 · N 人在线」不涉及（表述的是群聊会话而非角色启停）。
+  ②`character_admin.py` 启停按钮回调补 `st.session_state.characters_cache = None`（与第 55 条换头像同款）——侧边栏/大厅/聊天页的 enabled 来自该缓存，不清则启停后各页面状态文案不刷新。
+- **实施中修复的 bug**：hero 与舞台角标两行插值字符串漏写 f 前缀，`{...}` 被原样输出成字面类名（文案「离线」正确但 CSS 类失效、灰点不生效）——py_compile 不查字符串内容，靠 Playwright 找不到 `.hall-online` 元素暴露。教训：f-string 条件插值改 class 时，逐行核对 f 前缀。
+- **测试（21/21 PASS，全程未改角色启停状态：mika 用户所设停用、yuuka 启用，恰好覆盖两分支）**：①静态显示 14/14——大厅 hero「离线」+灰样式、侧边栏未花按钮 ::after「● 离线」灰色（computed style 验证）、进聊天页后选中行/信息条「三一综合学园茶话会会长 · 离线」/舞台角标均「离线」+灰点、yuuka 全链路仍「在线」绿点、无 Streamlit 异常；②启停即时刷新 7/7——管理页停用 yuuka → 侧边栏同 rerun 即变「● 离线」（缓存清理生效）、mika 不受影响、再启用即恢复「● 在线」；测后 state 文件已恢复原样（仅 mika: false，测试产生的 yuuka: true 记录已删——语义等价但保持用户原始状态）。
+- **范围控制**：后端/启停语义/403 拦截/fragment 结构/群聊语义/llm/tts 零改动；CSS 仅新增三条灰点变体规则不动既有布局。
+### 58. 切换角色时角色信息卡 / 😀 表情按钮闪烁根除：render_app 大 fragment（2026-10-18）
+- **现象（用户报告，多年遗留）**：切换角色时两处闪烁——角色信息卡片（名字/身份/在线 + 日历♡语音按钮的白色半透明卡）与 😀 表情展开按钮。
+- **根因（第 14 条结论的遗留场景）**：第 14 条已定位闪烁根因＝**full-app rerun**（整页重跑时带白色背景的元素被 React 卸载重建/重绘露白，CSS 方向全部无效），并用 @st.fragment 隔离了聊天交互区（第 16 条又隔离了侧边栏展开/收起）。但**侧边栏的角色切换等页面跳转按钮当时保留 `st.rerun()` 整页重跑**（「切页本就需要整页重跑」）——切页场景的闪烁一直未处理，即本次用户所见。
+- **方案（沿用第 14/16 条 fragment 方法，把切页也收进 fragment rerun）**：
+  ①新增 `@st.fragment def render_app()` 包住「侧边栏 + 页面路由 + 底部版权」（main() 只保留 set_page_config / init_session_state / 全局 CSS / render_app()）；
+  ②`render_sidebar` 去掉自己的 `@st.fragment`（并入 render_app，否则侧边栏交互只重跑内层、主区不更新）；`render_hall_carousel` 同样去掉（嵌套 fragment 内的交互无法触发外层，「开始聊天」切不了页）；
+  ③全部导航按钮（侧边栏角色/群聊/管理/设置/返回主页、角色分组展开收起、大厅「开始聊天」「重新加载」、聊天页「返回主页」）由「点击处理 + `st.rerun()`」改为 **on_click 回调改 session_state**（回调先于脚本执行，widget 交互只触发 render_app 的 fragment rerun，React 原位更新子树不闪）；新增 5 个模块级回调（`_nav_to_character/_nav_to_group/_nav_to_page/_reload_characters/_toggle_sidebar_section`）；
+  ④`render_chat_fragment` 保留 `@st.fragment` 成为嵌套内层——聊天交互（发送/emoji）仍只重跑聊天区，立绘/信息条不动（第 14 条行为不变）；其内 3 处 `st.rerun(scope="fragment")` 语义不变；
+  ⑤character_admin.py 零改动：其内部既有的 `st.rerun()`（app 作用域整页）仍正常（管理页无闪烁元素），且已用临时计数器实测整页 rerun 后 render_app 正常工作。
+- **前置实验（决定方案可行性）**：8502 端口隔离验证 Streamlit 1.63 嵌套 fragment——外层 fragment rerun 时内层随之重执行（runs 1→2）、内层交互只重跑内层（2→3）、无异常。结论：嵌套合法，「外层 rerun 更新全页、内层 rerun 隔离聊天区」的双层结构可行。
+- **验证（决定性 18/18 + 功能回归 7/7，测后临时计数器已移除、前端已重启）**：①用第 16 条的整页 rerun 计数器（main 主体注入 `#dbg-runs`，fragment rerun 不执行 main 故不 +1）实测七个场景——开始聊天 / 侧边栏切角色（未花↔优香）/ 切回 / emoji 开合 / 进群聊 / 进设置 / 返回主页 / 分组收起——**全程 data-n=1（零整页 rerun）**，且两次角色切换后 `.character-info` 节点身份保持（JS 引用相等 + isConnected，React 复用非重建）；②功能回归：嵌套 fragment 下真实发送回复正常、往返切换聊天历史保留、管理页打开 + 「🔄 刷新」（app-scope 整页 rerun 路径）正常、整页 rerun 后返回主页正常、无 pageerror / 无 stException。
+- **未验证项（环境限制，既有结论）**：Playwright 软件渲染抓不到视觉闪烁（第 14 条时期已证），机制层已用「零整页 rerun + 节点身份保持」决定性证明，最终视觉效果待用户真实浏览器肉眼确认。
+### 59. 切角色闪烁真凶定位与根除：聊天输入区 widget key 稳定化（2026-10-18）
+- **现象（用户复测第 58 条后报告仍未解决）**：侧边栏切换角色时主区两处闪（角色信息卡 + 😀 表情按钮区域）；侧边栏本身无闪烁。
+- **DOM 级诊断（节点身份追踪 + MutationObserver + transition 事件，Playwright）**：第 58 条 render_app 大 fragment 后整页 rerun 已消除（上轮 data-n=1 验证），但切角色瞬间仍有一批元素被**卸载重建**：MutationObserver 捕获 3 对 DEL/ADD——`chat_input_{key_base}`（输入框容器）、`send_{key_base}`（发送按钮）、`voice_toggle_{key_base}`（隐藏语音按钮）——**根因：聊天 fragment 输入区三个 widget 的 key 都含 key_base（角色/群 id），切角色即 key 变化，Streamlit 视为不同 widget 整体重建**；且 `stElementContainer` computed `transition: all` 使新挂载容器播放 opacity 0→1 渐入（实测 3 次 `transitionrun prop=opacity`）——输入区整排「消失→重挂→淡入」＝闪。信息卡/立绘/背景/日历/语音 iframe 节点全部身份保持（iframe 因 srcdoc 不随角色变化被 React 复用）。
+- **修复（`frontend/streamlit_app.py`，治本＝让切角色时 key 不变）**：①输入区 key 稳定化——`chat_input_{key_base}`→`"chat_input"`、`send_{key_base}`→`"send_msg"`、`voice_toggle_{key_base}`→`"voice_toggle"`（emoji 面板按钮 key `emoji_{input_key}_{i}` 随固定 input_key 自动稳定；`_prepare_send` 内 input_key 同步固定；同一时刻只渲染一个聊天 fragment 故无 key 冲突）；②CSS 与 voice iframe JS 两处选择器 `[class*="st-key-voice_toggle_"]` 去尾下划线（固定 key 后类名为 `st-key-voice_toggle`）；③全局 CSS `[data-testid="stElementContainer"] { transition: height .3s ease, width .3s ease !important }`——排除 opacity 挂载淡入（保险），保留尺寸过渡。
+- **副作用（可接受，视为特性）**：输入草稿跨角色/群聊保留（固定 key 共享 value）——切角色不再清空打到一半的字。
+- **验证**：①诊断复测：13 项关键元素节点身份**全部 KEEP**（信息卡及子元素/两 iframe/输入框/😀 popover 按钮/发送按钮/立绘/背景/舞台），主区 **Mutation 零增删**、**零 opacity 过渡**——切角色时 DOM 完全无卸载/挂载（注：首轮诊断 popoverBtn 误报 REBUILD 系检测假象——popover 按钮 textContent 实为 "😀expand_more"（含 Material 图标字），纯 '😀' 匹配前后皆 null 判 false；用 includes('😀') 复测 same=True）；②功能回归 12/12：草稿跨角色保留、emoji 追加、语音开关（iframe 内 #voice-btn）、真实发送 200、发送后清空、往返切换历史保留、群聊（共享 key 无冲突）、管理页/主页、无异常。
+- **过程中发现的既有 bug（未修，记录待办）**：text_input 有焦点时首次点击侧边栏导航会丢失（fill/输入后直接点角色按钮不切换，先点空白处 blur 或二次点击则正常）——事件流实测 mousedown→blur→focus→mouseup→click 均正常派发到按钮，判定为 blur 值提交触发的 fragment rerun 与 click interaction 的竞争；git stash 回 f2ad982 旧代码复现同样失败＝**第 51 条时期即存在**，非本轮引入，不在本轮修（涉及 Streamlit 1.63 interaction 队列机制，需专项研究）。
+- **未验证项（环境限制，既有结论）**：Playwright 软件渲染抓不到 GPU 合成层的视觉闪（第 14 条时期已证），本轮以「切角色零 DOM 重建 + 零挂载动画」为机制层决定性证明，最终视觉效果待用户真实浏览器确认。
+### 60. 点表情时聊天区整体闪烁根除：emoji 面板纯 HTML iframe 化（2026-10-18）
+- **现象（用户复测第 59 条后报告，且"更糟糕"）**：将表情输入到聊天框时，双方头像、聊天框、输入文本框、发送按钮**均会闪烁**。
+- **诊断方法论突破（本轮核心）**：软件渲染 Playwright 的 DOM/Mutation/LCP/transition 四件套在该场景**全部干净**（零图片重载、零布局位移、mutation 仅属性级）——闪发生在 **GPU 合成层**（软件渲染抓不到，第 14/59 条"未验证项"的同源限制）。改用**真实 Chrome（CDP attach）+ Page.startScreencast 捕帧 + 相邻帧像素差分析**直接看见：点表情后有一帧聊天区内容整体"变淡消失"（输入区近白占比 69.6%→59.9%，深色不变＝原位渲染层内容缺失，非露白非位移）。
+- **根因**：emoji 面板是 st.popover 内 **40 个 st.button**。每次 fragment rerun（点 emoji 的 on_click 回调触发）时它们的 ElementContainer 批量属性更新（单次点击实测 ~105 次 mutation，其中 80 次属性风暴）→ Chrome 样式重算+重绘风暴 → 合成器在重绘完成前推了一帧空内容＝闪。
+- **修复（`frontend/streamlit_app.py`，_render_emoji_panel 重写 + 删除 _append_emoji）**：emoji 网格改为 **components.html 纯 HTML iframe**（项目既有 cal/voice 零 rerun iframe 模式）：rerun 时 srcdoc 不变被 React 复用（零属性风暴，实测属性变化从 105 次降至 3 次）；点击由 iframe 内 JS 处理——用**父窗口原型**的 value setter 改输入框值（`PV.Object.getOwnPropertyDescriptor(PV.HTMLInputElement.prototype,'value').set`）+ dispatch 父窗口 Event('input')（更新 React state，输入框立即显示）+ `el.focus(); el.blur()`（提升 Streamlit 前端 committedValue）。
+- **Streamlit 1.63 TextInput 双值模型（重要机制发现）**：input 事件只更新 React inputValue（显示层）；Enter/blur 只提升**本地** committedValue；**值在下一次 interaction（如点发送按钮）触发 rerun 时才随 widget states 快照发给服务器**。三个验证陷阱（均实测踩坑）：①reload 后查输入框值永远为空（值从未单独发送）——必须点发送看消息内容才是正确验证法；②iframe 内 dispatch Enter 无效（推测跨 realm 合成事件未触发 Streamlit 的 keydown 提交路径），focus+blur 有效；③软件渲染与真实 Chrome 行为一致，差异在渲染层不在事件层。
+- **验证**：①GPU 帧差复测：表情点击场景帧差全部 <0.1%（修复前整聊天区 2.7-2.8% 缺内容帧两帧）——闪烁根除；②功能回归 13/13：emoji 叠加注入（😀🙃）、消息发送进历史、输入框清空、回复生成、群聊 emoji 面板、切角色、管理页/设置页/主页无异常。
+- **附带收益**：emoji 点击后 popover 不再需要服务器回调——popover 保持打开可连点多个表情（体验提升）。
+### 61. 切角色空白帧缩短：立绘/背景 base64 改后端 URL + preload 预取（2026-10-18）
+- **现象（用户复测第 59 条报告）**：切换角色时整个页面闪。
+- **GPU 帧差定位**：切角色呈「旧立绘消失(6%) → 空白静止 2-3 帧 → 新立绘两帧渐显(11%+10%)」模式。根因＝立绘/背景以 base64 data URI 内嵌 st.markdown HTML（mika.png 1.6MB→base64 约 2.2MB），每次 render_app fragment rerun 时 React innerHTML 大替换+解析阻塞主线程，期间合成器无新帧（空白期），新立绘 base64 重新解码渐显。
+- **修复（后端 main.py + 前端 streamlit_app.py）**：
+  ①后端新增 `GET /api/assets/{subdir}/{filename}`（character/background 两个白名单子目录，文件名正则白名单+resolve 防路径穿越，FileResponse + no-cache 协商缓存，同 avatar 端点模式）；
+  ②前端 `get_character_portrait`/`get_background` 改返回 URL（本地 exists 检测保留用于回退逻辑，HTML 从 2.2MB 缩到几十字节）；主页 Hero CSS background 一并受益；
+  ③聊天页/主页注入 `<link rel="preload" as="image">` 预取所有角色立绘+背景（进任一页面后其他角色立绘已进 HTTP 缓存，切角色零网络等待；URL 固定无版本号，React 对相同 HTML 复用零开销）。
+- **安全验证**：路径穿越 `../main.py` → 404；非白名单子目录 → 404；正常文件 → 200。
+- **验证**：①GPU 帧差复测：空白期 3 帧→2 帧，新立绘**两帧渐显变一帧到位**(22%)；②功能回归 13/13（同第 60 条回归套件）：主页 Hero URL 引用、聊天页立绘/背景加载完成、preload 注入、日历/语音 iframe 在位、emoji 面板+发送、切角色节点身份保持（stage/背景/两 iframe 全 KEEP）、mika 立绘 URL 切换、群聊/管理页/设置页/主页无异常。
+- **范围控制**：emoji 面板/输入区/fragment 架构/群聊逻辑/llm/tts 零改动；立绘与背景文件位置不动（仍在 frontend/assets/）。
+- **遗留（可接受）**：切角色仍有 2 帧空白（~32ms，React reconcile 主线程阻塞，非图片加载）——从"闪烁感"降为"切换感"；若用户复测仍觉闪，下一步方向为 React 分批 commit 深挖或 CSS 淡入过渡。
+### 62. 全页闪烁真凶根除：恢复 Streamlit 防闪 opacity 过渡 + 双发守卫 + assets 304（2026-10-18）
+- **现象（用户复测第 61 条后仍闪，提供 1920×1080/20fps/27s 真实录屏铁证）**：点表情、切角色均整页闪。录屏逐帧分析（541 帧）：0.8-4.0s 有 8 次全屏级变化（38-42% 像素，单帧亮度 190→221、近白 29%→46%＝露白）；4.8-9.0s 有 9 次右栏 8.3% 变化（消息区亮度 216→194＝内容缺失变暗）。
+- **真凶（第 59 条自己引入的 CSS 回归）**：Streamlit rerun 时给运行中的 ElementContainer 切换 emotion 类（`1vo6xi6`↔`gmdcco`，后者含 `opacity:0.33; transition: opacity 1s ease-in 0.5s`）。**0.5s 延迟过渡是 Streamlit 的防闪机制**——短 rerun（<0.5s）在过渡启动前结束，opacity 视觉不变。第 59 条写的 `transition: height .3s, width .3s !important` 覆盖掉了 opacity 过渡 → rerun 期间 class 切到 0.33 立即生效、结束瞬回 1.0 ＝ 每次 rerun 全页「瞬间变淡→恢复」。表情注入（fragment rerun）与切角色（render_app rerun）全部中招。
+- **修复（`frontend/streamlit_app.py` ~line 1463）**：stElementContainer 过渡规则改回 `transition: height 0.3s ease, width 0.3s ease, opacity 1s ease-in 0.5s !important`——显式保留 Streamlit 的 opacity 防闪过渡（教训：勿删框架自带的防闪机制）。
+- **GPU 验证（真实 Chrome + CDP screencast 帧差 + 亮度分类）**：表情场景 3 连点注入帧差全部 <0.1%（修复前 2.7-2.8% 缺内容帧）；切角色为**单一原子帧切换**（22.5% 一帧到位，无中间帧）；亮度序列每帧均处于合法页面态（优香 179.5 / 弹层 184-185 / 未花 191.1），**无任何变暗、露白、混合中间帧**。
+- **诊断过程中的两个重要方法论发现（测试环境伪影，记录防再踩）**：
+  ①**窗口遮挡伪影**：Chrome 窗口被遮挡时合成器暂停出帧，screencast 只在输入事件后补帧且内容滞后 1 个交互周期——曾误判为「DOM 已切换但画面滞留 3.5s」。测试须 `--disable-backgrounding-occluded-windows` + `bring_to_front` + rAF 心跳监控；
+  ②**图片解码假设否定法**：mika.png 2.2MB 冷解码仅 83.7ms、缓存后 0.3ms——解码不是切换延迟因素，勿凭直觉归因。
+- **顺带修复 A（数据完整性，`frontend/streamlit_app.py` _prepare_send）**：发完消息后快速连续切换导航时，Streamlit 对排队 widget 事件的重放会让 send 按钮 on_click 带着旧输入值（鬼影文本）二次触发 → **同一条消息重复发送+重复生成回复**（实测切回原角色后 POST /api/chat 多一次）。守卫：5 秒内完全相同文本视为重放丢弃（真实用户重发同一句至少要等 LLM 回复完成，远超 5 秒，无误伤）。验证：发消息后极速(0.3s)+中速(2.5s)连切共 10 次，POST 零新增、消息行数稳定。
+- **顺带修复 B（性能，`backend/main.py` avatar + assets 端点）**：FileResponse 只发 ETag **不处理 If-None-Match**（Starlette 无 304 判定），no-cache 下浏览器每次 rerun 整图重拉（实测每次 rerun mika.png 1.6MB 等全量 200，be.log 刷屏）。显式比对 etag（mtime_ns+size）命中回 304 空体。验证：curl 协商 304 生效；二次进入页面 assets 请求 200=5 冻结、304 递增。
+- **功能回归 11/11**：emoji 注入+发送回复、语音开关（iframe #voice-btn 🔊→🔇→🔊）、群聊、管理页、设置页、主页、切角色历史保留、全程无 stException。
+- **遗留（低优先）**：聊天 fragment 内 `/api/tts/status` 探测（timeout=3，5s 缓存）在 TTS 合成期间可能给导航 rerun 增加最长 3s 延迟（GIL 竞争）；输入框有焦点时首击导航丢失（第 51 条起既有，未修）。
+### 63. 角色创建与删除上线：服务端独立校验 + 安全删除 + in-flight 拦截（2026-10-19）
+- **功能（第四阶段）**：管理页「➕ 创建角色」（ID/名称/简介/人设提示词/可选头像）+ 每角色「🗑 删除」（checkbox 二次确认，显示名称与 ID）。
+- **新增 API（backend/main.py）**：`POST /api/characters`（创建，头像可选 base64，失败回滚本次目录）；`DELETE /api/characters/{id}`（删除，in-flight 使用中 409 拒绝）。`chat_inflight` 计数器：chat/group/tts 请求开始 +1 结束 finally -1（asyncio 单线程内同步增减无竞态），删除前检查拦截正在被聊天流程使用的角色（实测 409 生效）。限制：/ws/chat 不计数（前端未用该端点）。
+- **服务层（character_service.py）**：`create_character`——ID 白名单正则 `^[A-Za-z0-9_-]{1,32}$`（天然拒绝路径穿越）、空名称/空提示词/重复 ID/已存在目录全 400 拒绝、目录双保险校验落 characters/ 直接子目录、失败 rmtree 本次目录；`write_new_avatar`（校验与更换头像共用新抽出的 `_validate_image`，行为不变）；`delete_character`——先 rename 到 `characters/.deleting-*` 隐藏目录（原子，后续任何失败目录都不在原地）→ 清内存 `_characters`+`discovery` → rmtree（失败返回 cleanup_warning，角色已一致消失）。`character_state.py` 新增 `remove_record`（删启停记录防残留）；`load_all`/`health_report` 跳过 `.` 开头隐藏目录（`.deleting-*` 不参与扫描，必要最小修改）。
+- **character.json 沿用现有字段结构**：id/name/description/model=qwen2.5:7b-instruct-q4_K_M/temperature/top_p/max_tokens/color/greeting，不写 tts（可选配置，未配置健康检查 tts_ok=None 不算异常）；无头像时 `avatar_ext=None` 走前端既有 👤 兜底，不复制其他角色文件。
+- **前端（character_admin.py）**：创建视图（_CREATE_KEY 切换，表单初值只设一次防 widget key 赋值炸，失败换 uploader key 清选择）；删除二次确认（_DEL_KEY per 卡片内展开，checkbox 勾选才可确认）；删除成功后清 admin 缓存 + `characters_cache` + 该角色 `conversations` 历史 + 路由重置（若当前正在该角色聊天页）。
+- **测试 47/47 通过**（接口级）：创建（合法/重复 ID/8 种非法 ID 含空格中文斜杠点开头超长/空名称/空提示词/已存在目录不覆盖内容未动/路径穿越未写出/新角色健康检查+真实单聊成功/无头像兜底/坏 base64 回滚）；in-flight（聊天进行中 DELETE 409）；删除（成功后目录/列表/健康/状态记录全清、404、穿越拒绝、优香未花目录与状态不受影响）；回归（优香未花在列、健康全绿、TTS 状态、模型预加载、优香单聊、群聊双回复、启停正常）。`git diff --check` 干净，测试脚本与辅助目录已清理。
+### 64. 创建角色补立绘/背景三选一：立绘留空不指向其他角色（2026-10-19）
+- **需求（用户验收第 63 条后提出）**：①确认立绘与头像非同一文件（头像在 characters/{id}/avatar.{ext} 经 /api/characters/{id}/avatar，立绘在 frontend/assets/character/{id}.{ext} 经 /api/assets/character/{name}）；②创建时无立绘上传选项，且立绘缺失时聊天页回退显示头像大图；③背景需要三选一（上传 / 复用已存在 / 无背景纯色）。
+- **立绘（第四阶段补充）**：新存角色目录 characters/{id}/portrait.{ext}（与头像同目录）；新端点 GET /api/characters/{id}/portrait（no-cache 协商缓存 304，同 avatar 模式）+ POST（创建请求内 portrait 字段）；前端 get_character_portrait 双位置检测（先角色目录→回退 assets）；**缺失时聊天页留空占位（名字首字浅底），不再回退头像、不指向其他角色文件**。现有 yuuka/mika 立绘位置不动。
+- **背景三选一（互斥，服务端校验）**：①上传 → characters/{id}/background.{ext}；②复用已存在背景（background_copy_from="default" 或角色 id）→ `_find_background_file` 回退链（角色目录→assets/background/{id}→全局 background.jpg）**复制文件**，不改其他角色；③无背景 → character.json 写可选 background_color 字段（hex 正则 ^#RGB$|^#RRGGBB$ 校验），主视图纯色。全不提供=现有回退行为。新端点 GET /api/characters/{id}/background（304 同模式）；列表返回新增 background_color 字段。
+- **前端（character_admin.py 创建页）**：立绘 file_uploader（可选）+ 背景三选一 radio（上传/复用 selectbox 列出「默认背景」+各角色/无背景 color_picker）；复用背景为**复制**语义（标注不影响原角色）。
+- **测试 36/36 通过**：立绘（创建带立绘/无立绘留空 404/304 协商/其他角色未动）；背景三选一（上传/复用 yuuka 复制成功原文件未动/复用 default 无全局背景 400 明确/复用无背景角色 400/纯色写 background_color/互斥 400/非法颜色 400/恶意 copy_from 拒绝未穿越）；回归（优香未花 nagisa 在列、健康全绿、background_color 兼容 None、优香单聊、群聊、TTS）。
+- **实施教训**：两处 edit 因"文件自上次读取后被修改"被拒而遗漏——CharacterCreate 字段（pydantic AttributeError）与 create_character 签名（TypeError unexpected keyword），测试第一轮全部 500 暴露；教训：edit 被拒后必须重做该 edit 并核对（不能只重做相邻部分），py_compile 只查语法不查名字解析。
+- **遗留（已知）**：桐藤渚（nagisa）创建时无立绘选项，现立绘区显示占位（名字首字）——补立绘需删除重建（创建时有立绘选项）或后续给编辑页加立绘/背景上传；管理页编辑页暂无立绘/背景更换入口。
+### 65. 编辑页补立绘/背景更换 + 主页立绘缺失留空（2026-10-19）
+- **需求（用户复测第 64 条后提出）**：①主页立绘区仍显示头像大图（回退头像被 Hero CSS 拉伸成模糊大图）；②修改角色（编辑页）没有立绘/背景选项——第 64 条只做了创建页。
+- **主页修复（streamlit_app.py render_hall_carousel）**：立绘缺失时不再回退头像 URL（`get_character_portrait(cid) or avatar_url(...)` 改为仅 `get_character_portrait(cid)`），Hero 立绘层条件化——无立绘留空（与聊天页占位策略一致，用户明确要求），有立绘才加 url 层。
+- **编辑页补全（character_admin.py _render_edit_page）**：新增「立绘」区块（预览 + file_uploader + 更换按钮，同头像模式，uploader key 序号计数器）与「背景」区块（三选一 radio：上传/复用已存在/纯色 color_picker；radio 初值按当前背景状态智能设置——有 background_color 默认选纯色；当前背景状态描述行显示）。_leave_edit 清理新增 widget key。
+- **新增 API（backend/main.py）**：`POST /api/characters/{id}/portrait`（更换立绘，base64，校验同头像）；`POST /api/characters/{id}/background`（三选一互斥：image 上传/copy_from 复制/color 纯色，纯色写 character.json background_color + 删背景文件，上传/复用清 background_color 字段）；GET profile 返回新增 portrait_ext（**双位置兼容**：角色目录→assets 旧位置，现有角色编辑页能预览旧立绘）/background_color/background_ext。
+- **服务层（character_service.py）**：`update_portrait`（_validate_image + 换格式移开旧立绘备份回滚）；`update_background`（三选一互斥、全回滚、bg_color 优先级高于背景文件）；共用抽出 `_replace_image_file`（portrait/background 与 update_avatar 同模式）与 `_set_json_fields`（v=None 删字段原子写）；`_get_portrait_ext`/`_get_background_ext`。
+- **测试 32/32 通过**：profile 新字段、立绘（更换/304 协商/换格式旧文件移开/角色 404）、背景三选一（上传/复用 yuuka 复制成功原文件未动/纯色写 background_color 删背景文件/纯色切上传字段清除/互斥/全空拒/非法颜色拒/copy_from 404）、删除含立绘背景清理；回归（优香未花 nagisa 在列、健康全绿、优香 profile 双位置预览 jpeg、单聊、群聊、TTS）。
+- **范围**：llm/tts/fragment/CSS/群聊状态机零改动；编辑页更换立绘/背景复用创建时同一校验规则。
+- **第 65 条补充（用户复测报告"已创建角色无法更改背景/立绘"）**：根因＝前端 8501 进程是 21:29 启动的旧进程（代码修改在 21:45），Streamlit 对**导入模块**（character_admin.py）变更的热重载未生效，运行的是旧版编辑页（实测 Playwright DOM：立绘/背景区块完全缺失、无异常框）。重启前端进程后全部区块渲染成功。**教训：修改 streamlit 导入的模块文件后必须重启 8501 进程（只等热重载不可靠）；此前"改前端只需等待热重载"的经验仅适用主脚本 streamlit_app.py**。
+
+### 66. 角色创建目录结构与资源存储规范统一（以 yuuka/mika 为基准）（2026-10-20）
+- **需求（用户提出）**：前端创建的角色（Kirifuji_Nagisa）目录结构与资源存储位置与现有 yuuka/mika 不一致——第 64/65 条把立绘/背景写进了 `characters/{id}/portrait|background.{ext}`（内聚设计），而现有角色约定是立绘 `frontend/assets/character/{id}.{ext}`、背景 `frontend/assets/background/{id}.{ext}`；且新建角色 character.json 缺 `subtitle` 字段。要求以 yuuka/mika 为基准统一，兼容现有角色，不移动 yuuka/mika 文件，未经确认不批量迁移（Kirifuji_Nagisa 迁移经用户确认后执行）。
+- **统一规范（第 66 条起生效）**：`characters/{id}/` 只存 character.json + prompt.txt + avatar.{ext}（+可选 reference.wav）；立绘/背景存 `frontend/assets/{character|background}/{id}.{ext}`；character.json 写 subtitle（可选，字段结构与 yuuka/mika 一致）；tts 仍不写（可选配置，未配置无语音不算异常）；background_color 纯色模式为第四阶段新能力，保留为 json 字段。
+- **服务层（character_service.py）**：`create_character` 加 subtitle 参数，立绘/背景改写 assets 规范位置（复用 `_replace_image_file`，含旧格式清理与备份回滚），失败清理含本次写入的 assets 文件；新增 `_write_image_to_assets`（update 用：写规范位置 + 清角色目录旧位置残留，残留先 rename `.replacing` 暂存、失败恢复、成功删除，残留不被白名单读取误取）；`update_portrait`/`update_background`（上传/复用）改写规范位置；`update_background` 纯色模式删两处旧文件；`delete_character` 同步清理 assets 该 ID 的立绘/背景（只删 `{id}.{ext}` 精确匹配，无 glob，失败并入 cleanup_warning 不影响删除）；读取优先级统一翻转为**规范位置优先、旧位置兼容回退**（`_get_portrait_ext`/`_get_background_ext` 补 assets 检测 + webp、`_find_background_file` 同步），旧位置文件（如有）仍可读，不破坏存量。
+- **API（backend/main.py）**：CharacterCreate 加 `subtitle`；GET `/api/characters/{id}/portrait|background` 端点补规范位置回退（编辑页预览 URL 依赖这两个端点，迁移后立绘不再 404）。
+- **前端**：character_admin.py 创建页加「副标题（可选）」输入框（key `_csubtitle_new`，_leave_create 同步清理）；streamlit_app.py `get_character_portrait`/`get_background` 优先级翻转为 assets 规范位置优先（扩展名清单补 webp 与后端白名单对齐）。
+- **Kirifuji_Nagisa 迁移（用户确认后执行，可恢复移动）**：portrait.png → frontend/assets/character/Kirifuji_Nagisa.png，background.jpg → frontend/assets/background/Kirifuji_Nagisa.jpg；迁移后角色目录仅 avatar.png/character.json/prompt.txt，与 yuuka/mika 结构一致。
+- **测试 46/46 通过**（cache/test_std66.py，接口级）：创建（角色目录仅 json/prompt/avatar、character.json 10 字段含 subtitle、立绘/背景落 assets）；资源读取（assets 直连 + 角色端点回退 + 头像 + profile portrait_ext 全 200）；更新（换立绘清旧位置残留、复用 yuuka 背景写规范位置且原文件未动、切纯色清文件写字段）；yuuka/mika 回归（头像 ext/subtitle/has_tts/tts_ok/立绘/背景/reference.wav/健康检查）；Nagisa 迁移后（目录结构一致、立绘/背景 200）；删除（目录+assets 立绘背景同步清理、列表无残留）；单聊冒烟（Nagisa 迁移后 + yuuka 各 200 且在角色人设内回复）。`git status` 无无关修改。测试脚本用完已清理。
+- **教训**：验收脚本断言要与 API 实际暴露字段对齐（tts 出于安全只暴露 `has_tts` 布尔不暴露路径字典；健康检查角色数据在 `characters` 数组）——首轮 3 个"失败"全是断言写错，功能本身正常。
+- **第 66 条补（用户复测后要求）**：侧边栏角色列表下方的「＋ 添加角色<span>即将上线</span>」纯 HTML 占位（创建功能上线前的视觉入口，无功能死按钮）替换为真实 st.button（key=sb_add_char，on_click=_nav_to_page("charadmin")），点击跳管理页创建角色；.sb-soon CSS 保留（「语音·聊天页开关」行仍在用）。
+- **第 66 条补二（用户纠正）**：侧边栏「＋ 添加角色」此前跳「👤 角色管理」列表与底部入口功能重复，改为直达管理页创建视图——streamlit_app.py 新增 `_nav_to_create_character` 回调（_nav_to_page("charadmin") + 设 character_admin._CREATE_KEY），on_click 直达「➕ 创建角色」表单；管理页内既有「← 返回角色列表」行为不变。

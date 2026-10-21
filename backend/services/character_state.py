@@ -85,6 +85,23 @@ class CharacterStateService:
             json.dump({"enabled": enabled_map}, f, ensure_ascii=False, indent=2)
         return self.diagnose()
 
+    def remove_record(self, character_id: str) -> None:
+        """删除角色的启用状态记录（角色删除后调用，防止状态文件残留）。
+
+        状态文件缺失时无需清理；删除失败（磁盘故障）仅抛出由调用方处理，
+        本方法本身不阻断删除流程（残留记录只影响「默认启用」语义，
+        角色目录已删，无实际影响）。
+        """
+        if not STATE_FILE.exists():
+            return
+        state = self._load()
+        enabled_map = dict(state.get("enabled", {}))
+        if character_id not in enabled_map:
+            return
+        enabled_map.pop(character_id, None)
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"enabled": enabled_map}, f, ensure_ascii=False, indent=2)
+
     def diagnose(self) -> dict:
         """状态文件健康诊断（损坏时返回备份路径与原因，供 health_report 报告）"""
         self._load()
@@ -111,6 +128,9 @@ class CharacterStateService:
 
         for sub in sorted(CHARACTERS_DIR.iterdir()):
             if not sub.is_dir():
+                continue
+            if sub.name.startswith("."):
+                # 隐藏目录（.deleting-* 删除暂存）不参与健康检查（与 load_all 一致）
                 continue
             entry = {
                 "dir": sub.name,

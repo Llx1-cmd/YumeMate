@@ -29,3 +29,7 @@ dbg_*.png
 .DS_Store
 Thumbs.db
 desktop.ini
+# 运行时状态数据（角色启停/群聊配置：含用户个人会话数据，首次运行自动重建；
+# 模型选择 model_state.json 仍保持版本管理，勿加入此处）
+backend/data/character_state.json
+backend/data/groups.json

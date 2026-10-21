@@ -1,4 +1,4 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Response
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Response, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 from pydantic import BaseModel
@@ -70,6 +70,22 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
+# 正在被活动聊天流程使用的角色计数（第四阶段删除安全检查）：
+# chat/group/tts 请求开始时对涉及角色 +1、结束时 -1（asyncio 单线程事件
+# loop 内同步增减，无竞态）；删除时计数 > 0 则 409 拒绝。
+# 限制：/ws/chat 流式端点不计数（前端实际使用 /api/chat，未用 WebSocket）。
+chat_inflight: Dict[str, int] = {}
+
+
+def _inflight_add(ids) -> None:
+    for i in ids:
+        chat_inflight[i] = chat_inflight.get(i, 0) + 1
+
+
+def _inflight_release(ids) -> None:
+    for i in ids:
+        chat_inflight[i] = max(0, chat_inflight.get(i, 1) - 1)
+
 
 @app.get("/")
 async def root():
@@ -99,6 +115,49 @@ async def list_characters():
 
 class CharacterEnabledSwitch(BaseModel):
     enabled: bool
+
+
+class CharacterProfileUpdate(BaseModel):
+    """编辑角色名称与简介（character.json 已有字段，沿用原格式）"""
+    name: str
+    description: str = ""
+
+
+class CharacterPromptUpdate(BaseModel):
+    prompt: str
+
+
+class CharacterAvatarUpload(BaseModel):
+    """头像上传：图片字节 base64 编码（避免 multipart 额外依赖）"""
+    image: str
+
+
+class CharacterBackgroundUpdate(BaseModel):
+    """更换背景（第四阶段补充）：三选一互斥——image（上传 base64）/
+    copy_from（复用已存在："default" 或角色 id）/ color（无背景纯色 hex）"""
+    image: str = None
+    copy_from: str = None
+    color: str = None
+
+
+class CharacterCreate(BaseModel):
+    """创建新角色（第四阶段）：头像/立绘/背景可选（base64）。
+
+    subtitle 可选（第 66 条统一：character.json 字段结构与 yuuka/mika 一致）。
+    立绘/背景写 frontend/assets/ 规范位置（与现有角色相同）。
+    背景三选一（互斥）：background（上传）/ background_copy_from（复用
+    已存在背景："default" 或角色 id）/ background_color（无背景，主视图
+    纯色）；全不提供则不写背景（前端回退全局默认背景）。"""
+    id: str
+    name: str
+    subtitle: str = ""
+    description: str = ""
+    prompt: str
+    image: str = None
+    portrait: str = None
+    background: str = None
+    background_copy_from: str = None
+    background_color: str = None
 
 
 @app.get("/api/characters/health")
@@ -140,9 +199,143 @@ async def get_character(character_id: str):
     return cfg.to_public_dict()
 
 
+# ==================== 角色创建 / 删除（第四阶段） ====================
+
+@app.post("/api/characters")
+async def create_character_endpoint(m: CharacterCreate):
+    """创建新角色：服务端独立校验（ID 白名单正则 / 空名称 / 空提示词 /
+    重复 ID / 已存在目录 / 目录路径限制在 characters/ 直接子目录），
+    写 character.json + prompt.txt 并加载进内存；头像可选（base64，
+    共用更换头像的安全校验规则），未提供则留空（不指向其他角色文件）。
+    背景三选一（上传 / 复用已存在 / 无背景颜色，互斥），全不提供则回退
+    全局默认背景。任何图片校验/写入失败回滚本次创建（目录为本次新建），
+    不误删原有目录。"""
+    import base64
+
+    def _b64(v):
+        if not v:
+            return None
+        try:
+            return base64.b64decode(v, validate=True)
+        except Exception:
+            raise HTTPException(status_code=400, detail="图片数据不是有效的 base64 编码")
+
+    cfg = character_service.create_character(
+        m.id, m.name, m.prompt, m.description,
+        subtitle=m.subtitle,
+        avatar_data=_b64(m.image),
+        portrait_data=_b64(m.portrait),
+        background_data=_b64(m.background),
+        background_copy_from=m.background_copy_from,
+        background_color=m.background_color,
+    )
+    return {"status": "success", "character": cfg.to_public_dict()}
+
+
+@app.delete("/api/characters/{character_id}")
+async def delete_character_endpoint(character_id: str):
+    """删除角色：先检查是否正被活动聊天流程使用（in-flight 计数，使用中 409
+    拒绝）；再 rename 到 characters/.deleting-* 隐藏目录（原子操作，后续任何
+    步骤失败原目录都不在原地、不参与重扫），清内存缓存，清启用状态记录，
+    最后 rmtree 暂存目录（失败返回 cleanup_warning，角色已一致地消失）。
+    禁止路径穿越；只删该角色自己的目录/状态/缓存，其他角色不受影响。"""
+    if chat_inflight.get(character_id, 0) > 0:
+        raise HTTPException(
+            status_code=409,
+            detail="该角色正在被聊天流程使用，请稍后再删除",
+        )
+    result = character_service.delete_character(character_id)
+    character_state.remove_record(character_id)
+    chat_inflight.pop(character_id, None)
+    return {"status": "success", **result}
+
+
+# ==================== 角色配置编辑（第三阶段） ====================
+
+@app.get("/api/characters/{character_id}/profile")
+async def get_character_profile(character_id: str):
+    """编辑页数据：名称 / 简介 / 人设提示词全文（管理编辑用途）+ 当前头像扩展名"""
+    cfg = character_service.get(character_id)  # 不存在抛 404
+    return {
+        "id": cfg.id,
+        "name": cfg.name,
+        "description": cfg.description,
+        "prompt": cfg.prompt,
+        "avatar_ext": cfg._get_avatar_ext(),
+        "portrait_ext": cfg._get_portrait_ext(),
+        "background_color": cfg.background_color,
+        "background_ext": cfg._get_background_ext(),
+    }
+
+
+@app.put("/api/characters/{character_id}/profile")
+async def update_character_profile(character_id: str, m: CharacterProfileUpdate):
+    """编辑角色名称与简介：服务端校验（名称去空白、禁止为空），原子写回
+    character.json 并重载内存，返回最新公开信息（以服务端结果为准）"""
+    pub = character_service.update_profile(character_id, m.name, m.description)
+    return {"status": "success", "character": pub}
+
+
+@app.put("/api/characters/{character_id}/prompt")
+async def update_character_prompt(character_id: str, m: CharacterPromptUpdate):
+    """编辑人设提示词：禁止空提示词，原文写回 prompt.txt（保留换行与
+    中英日字符），保存后重读校验一致并重载内存（后续聊天即用新人设）"""
+    result = character_service.update_prompt(character_id, m.prompt)
+    return {"status": "success", **result}
+
+
+@app.post("/api/characters/{character_id}/avatar")
+async def update_character_avatar(character_id: str, m: CharacterAvatarUpload):
+    """更换角色头像：base64 解码后由服务端校验（大小 / PIL 可解码 /
+    PNG-JPG-WEBP 白名单），写入角色目录内安全路径，失败回滚"""
+    import base64
+    try:
+        data = base64.b64decode(m.image, validate=True)
+    except Exception:
+        raise HTTPException(status_code=400, detail="图片数据不是有效的 base64 编码")
+    result = character_service.update_avatar(character_id, data)
+    return {"status": "success", **result}
+
+
+@app.post("/api/characters/{character_id}/portrait")
+async def update_character_portrait(character_id: str, m: CharacterAvatarUpload):
+    """更换角色立绘（第四阶段补充）：base64 解码后由服务端校验（同头像
+    规则），写 characters/{id}/portrait.{ext}（与头像同目录），失败回滚"""
+    import base64
+    try:
+        data = base64.b64decode(m.image, validate=True)
+    except Exception:
+        raise HTTPException(status_code=400, detail="图片数据不是有效的 base64 编码")
+    result = character_service.update_portrait(character_id, data)
+    return {"status": "success", **result}
+
+
+@app.post("/api/characters/{character_id}/background")
+async def update_character_background(character_id: str, m: CharacterBackgroundUpdate):
+    """更换角色背景（第四阶段补充，三选一互斥）：上传（image）/ 复用已存在
+    （copy_from="default" 或角色 id，复制文件不改其他角色）/ 无背景纯色
+    （color hex，写 character.json 的 background_color 字段）"""
+    import base64
+    data = None
+    if m.image:
+        try:
+            data = base64.b64decode(m.image, validate=True)
+        except Exception:
+            raise HTTPException(status_code=400, detail="图片数据不是有效的 base64 编码")
+    result = character_service.update_background(
+        character_id, image_data=data, copy_from=m.copy_from, color=m.color
+    )
+    return {"status": "success", **result}
+
+
 @app.get("/api/characters/{character_id}/avatar")
-async def get_character_avatar(character_id: str):
-    """返回角色头像文件（前端 <img src=...> 直接用）"""
+async def get_character_avatar(character_id: str, request: Request):
+    """返回角色头像文件（前端 <img src=...> 直接用）。
+    Cache-Control: no-cache——浏览器可缓存但每次展示前须向服务器重新验证
+    （比对 etag 命中回 304 空体，几乎零开销），避免 heuristic 缓存导致
+    更换头像后旧图不刷新。
+    第 62 条补：FileResponse 只发 ETag 不处理 If-None-Match，no-cache 下
+    浏览器每次 rerun 都整图重拉；此处显式判 304。"""
     cfg = character_service.get(character_id)
     avatar_path = cfg.get_avatar_path()
     if not avatar_path or not avatar_path.exists():
@@ -150,7 +343,105 @@ async def get_character_avatar(character_id: str):
             status_code=404,
             content={"error": "角色未配置头像"}
         )
-    return FileResponse(str(avatar_path))
+    stat = avatar_path.stat()
+    etag = f'"{stat.st_mtime_ns:x}-{stat.st_size:x}"'
+    if etag in request.headers.get("if-none-match", ""):
+        return Response(status_code=304, headers={
+            "ETag": etag, "Cache-Control": "no-cache"})
+    return FileResponse(
+        str(avatar_path),
+        headers={"Cache-Control": "no-cache", "ETag": etag},
+    )
+
+
+def _serve_character_image(path, request: Request, missing_detail: str):
+    """角色目录图片文件统一响应（portrait/background 共用）：
+    no-cache 协商缓存（etag 比对命中回 304，同 avatar 端点模式）。"""
+    if not path or not path.exists():
+        return JSONResponse(status_code=404, content={"error": missing_detail})
+    stat = path.stat()
+    etag = f'"{stat.st_mtime_ns:x}-{stat.st_size:x}"'
+    if etag in request.headers.get("if-none-match", ""):
+        return Response(status_code=304, headers={
+            "ETag": etag, "Cache-Control": "no-cache"})
+    return FileResponse(str(path), headers={
+        "Cache-Control": "no-cache", "ETag": etag})
+
+
+@app.get("/api/characters/{character_id}/portrait")
+async def get_character_portrait_file(character_id: str, request: Request):
+    """返回角色立绘文件：优先规范位置 frontend/assets/character/{id}.{ext}
+    （第 66 条统一，与 yuuka/mika 一致），回退角色目录 portrait.{ext}
+    （第四阶段旧位置，兼容读取）；前端聊天页大图/主页 Hero/编辑页预览用"""
+    cfg = character_service.get(character_id)
+    path = None
+    for ext in (".png", ".jpg", ".jpeg", ".webp"):
+        p = _ASSETS_DIR / "character" / f"{character_id}{ext}"
+        if p.exists():
+            path = p
+            break
+    if path is None:
+        for ext in (".png", ".jpg", ".jpeg", ".webp"):
+            p = cfg.dir_path / f"portrait{ext}"
+            if p.exists():
+                path = p
+                break
+    return _serve_character_image(path, request, "角色未配置立绘")
+
+
+@app.get("/api/characters/{character_id}/background")
+async def get_character_background_file(character_id: str, request: Request):
+    """返回角色背景文件：优先规范位置 frontend/assets/background/{id}.{ext}
+    （第 66 条统一），回退角色目录 background.{ext}（旧位置，兼容读取）"""
+    cfg = character_service.get(character_id)
+    path = None
+    for ext in (".png", ".jpg", ".jpeg", ".webp"):
+        p = _ASSETS_DIR / "background" / f"{character_id}{ext}"
+        if p.exists():
+            path = p
+            break
+    if path is None:
+        for ext in (".png", ".jpg", ".jpeg", ".webp"):
+            p = cfg.dir_path / f"background{ext}"
+            if p.exists():
+                path = p
+                break
+    return _serve_character_image(path, request, "角色未配置背景")
+
+
+# ==================== 前端静态资产（立绘/背景，第 61 条） ====================
+# 此前立绘/背景由 Streamlit 以 base64 内嵌进 st.markdown 的 HTML（mika 立绘
+# 1.6MB → base64 约 2.2MB），每次 fragment rerun 都参与 React diff/innerHTML
+# 替换，是切角色时整页空白帧的主因。改为 URL 引用后 HTML 缩到几十字节，
+# 图片走浏览器 HTTP 缓存（FileResponse ETag/304），切换角色秒出。
+from pathlib import Path as _Path
+import re as _re
+
+_ASSETS_DIR = (_Path(__file__).resolve().parent.parent / "frontend" / "assets").resolve()
+_ASSET_SUBDIRS = {"character": "character", "background": "background"}
+_ASSET_NAME_RE = _re.compile(r"^[A-Za-z0-9_.\-]+$")
+
+
+@app.get("/api/assets/{subdir}/{filename}")
+async def get_frontend_asset(subdir: str, filename: str, request: Request):
+    """前端 assets 静态文件（立绘/背景）。文件名白名单 + resolve 防路径穿越；
+    no-cache 协商缓存：立绘更新后 etag 变化即得新图。
+    第 62 条补：FileResponse 不处理 If-None-Match（无 304 判定），no-cache 下
+    浏览器每次 rerun 都整图重拉（实测每次 rerun mika.png 1.6MB 等全量 200）。
+    显式比对 etag 命中即回 304 空体，rerun 零重传。"""
+    sub = _ASSET_SUBDIRS.get(subdir)
+    if sub is None or not _ASSET_NAME_RE.match(filename):
+        raise HTTPException(status_code=404, detail="资产不存在")
+    p = (_ASSETS_DIR / sub / filename).resolve()
+    if _ASSETS_DIR not in p.parents or not p.is_file():
+        raise HTTPException(status_code=404, detail="资产不存在")
+    stat = p.stat()
+    etag = f'"{stat.st_mtime_ns:x}-{stat.st_size:x}"'
+    if etag in request.headers.get("if-none-match", ""):
+        return Response(status_code=304, headers={
+            "ETag": etag, "Cache-Control": "no-cache"})
+    return FileResponse(str(p), headers={
+        "Cache-Control": "no-cache", "ETag": etag})
 
 
 # ==================== 语音接口（GPT-SoVITS，只增不改，不影响聊天 API） ====================
@@ -181,6 +472,7 @@ async def tts_audio(character_id: str, text: str):
             status_code=503,
             content={"error": "该角色未配置语音"},
         )
+    _inflight_add([character_id])
     try:
         wav = await asyncio.to_thread(
             tts_service.synthesize,
@@ -194,6 +486,8 @@ async def tts_audio(character_id: str, text: str):
             status_code=503,
             content={"error": f"语音生成失败: {e}"},
         )
+    finally:
+        _inflight_release([character_id])
     return Response(
         content=wav,
         media_type="audio/wav",
@@ -210,6 +504,7 @@ async def chat_endpoint(chat: ChatMessage):
     cfg = character_service.get(chat.character_id)
     if not character_state.is_enabled(chat.character_id):
         raise HTTPException(status_code=403, detail=f"角色已停用: {cfg.name}")
+    _inflight_add([chat.character_id])
     try:
         response = await llm_service.chat_complete(
             message=chat.message,
@@ -233,6 +528,8 @@ async def chat_endpoint(chat: ChatMessage):
                 "character_id": chat.character_id,
             }
         )
+    finally:
+        _inflight_release([chat.character_id])
 
 
 class ModelSwitch(BaseModel):
@@ -268,36 +565,41 @@ async def group_chat_endpoint(chat: GroupChatMessage):
     但每个成员用各自独立的 character prompt 调用，人格不合并。
     单个成员生成失败不阻断后续成员（文字占位，不进后续上下文）。
     """
+
     replies = []
     turn_replies = []
-    for member_id in chat.members:
-        try:
-            cfg = character_service.get(member_id)  # 角色不存在时抛 404
-        except HTTPException:
-            replies.append({"role": member_id, "content": f"⚠️ 成员 {member_id} 不存在", "ok": False})
-            continue
-        if not character_state.is_enabled(member_id):
-            # 停用成员：占位不进后续成员的上下文（与「不存在」同模式），不阻断其他成员
-            replies.append({"role": member_id, "content": f"⚠️ {cfg.name} 已停用", "ok": False})
-            continue
-        try:
-            text = await llm_service.group_chat_complete(
-                message=chat.message,
-                history=chat.history,
-                speaker=member_id,
-                turn_replies=turn_replies,
-            )
-            reply_content = text.strip()
-            ok = bool(reply_content)
-            if not ok:
+    _inflight_add(chat.members)
+    try:
+        for member_id in chat.members:
+            try:
+                cfg = character_service.get(member_id)  # 角色不存在时抛 404
+            except HTTPException:
+                replies.append({"role": member_id, "content": f"⚠️ 成员 {member_id} 不存在", "ok": False})
+                continue
+            if not character_state.is_enabled(member_id):
+                # 停用成员：占位不进后续成员的上下文（与「不存在」同模式），不阻断其他成员
+                replies.append({"role": member_id, "content": f"⚠️ {cfg.name} 已停用", "ok": False})
+                continue
+            try:
+                text = await llm_service.group_chat_complete(
+                    message=chat.message,
+                    history=chat.history,
+                    speaker=member_id,
+                    turn_replies=turn_replies,
+                )
+                reply_content = text.strip()
+                ok = bool(reply_content)
+                if not ok:
+                    reply_content = f"⚠️ {cfg.name} 暂时无法回复"
+            except Exception:
                 reply_content = f"⚠️ {cfg.name} 暂时无法回复"
-        except Exception:
-            reply_content = f"⚠️ {cfg.name} 暂时无法回复"
-            ok = False
-        # ok=False 的失败占位：前端只显示不写聊天历史，也不进后续成员的上下文
-        replies.append({"role": member_id, "content": reply_content, "ok": ok})
-        if ok:
-            turn_replies.append({"role": member_id, "content": reply_content})
+                ok = False
+            # ok=False 的失败占位：前端只显示不写聊天历史，也不进后续成员的上下文
+            replies.append({"role": member_id, "content": reply_content, "ok": ok})
+            if ok:
+                turn_replies.append({"role": member_id, "content": reply_content})
+    finally:
+        _inflight_release(chat.members)
     return {
         "replies": replies,
         "status": "success",
